@@ -15,15 +15,13 @@ from sqlalchemy import create_engine, text
 
 from etl.config import CORE_SCHEMA, MARTS_SCHEMA, OUTSIDE_STATE
 from etl.load import load_generators, load_storages
-from etl.marts import MART_DEFINITIONS, build_marts, verify_marts
+from etl.marts import _ACTIVE, _mart_definitions, build_marts, verify_marts
+
+from conftest import drop_core_tables
 
 ENGINE = create_engine(os.environ["DATABASE_URL"])
 
-MART_NAMES = tuple(MART_DEFINITIONS)
-
-# (core_table, units_properties, properties) per unit-kind.
-GENERATOR_KIND = ("generators", "generator_units_properties", "generator_properties")
-STORAGE_KIND = ("storages", "storage_units_properties", "storage_properties")
+MART_NAMES = tuple(_mart_definitions(CORE_SCHEMA))
 
 
 def _scalar(sql: str):
@@ -39,26 +37,18 @@ def _drop_marts():
             )
 
 
-def _drop_core():
-    with ENGINE.begin() as conn:
-        for table, links, props in (GENERATOR_KIND, STORAGE_KIND):
-            for tbl in (links, props):
-                conn.execute(text(f"DROP TABLE IF EXISTS {CORE_SCHEMA}.{tbl} CASCADE"))
-            conn.execute(text(f"DROP TABLE IF EXISTS {CORE_SCHEMA}.{table} CASCADE"))
-
-
 @pytest.fixture(scope="module")
 def _loaded_core():
     """Load both core kinds fresh before the marts are built."""
     _drop_marts()
-    _drop_core()
+    drop_core_tables(ENGINE)
     gen_report = load_generators()
     sto_report = load_storages()
     assert gen_report.passed, gen_report.errors
     assert sto_report.passed, sto_report.errors
     yield {"generators": gen_report, "storages": sto_report}
     _drop_marts()
-    _drop_core()
+    drop_core_tables(ENGINE)
 
 
 @pytest.fixture(scope="module")
@@ -495,7 +485,7 @@ class TestVerification:
 class TestCorePrecondition:
     def test_missing_core_tables_fails_cleanly(self, _loaded_core):
         """A build without the core tables fails gracefully, not with a raw DDL error."""
-        _drop_core()
+        drop_core_tables(ENGINE)
         report = build_marts()
         assert not report.passed
         assert report.created == []
@@ -504,3 +494,26 @@ class TestCorePrecondition:
             "core.generators" in e and "core.storages" in e for e in report.errors
         ), f"expected a clear core-tables-missing error, got {report.errors}"
         # _loaded_core teardown will drop whatever remains
+
+
+class TestCurrentDatePivots:
+    """The marts stay current-date pivots (issue #9).
+
+    They are the stored, spec-literal shape and cannot answer an arbitrary
+    interval, so the visualization timescope reads Core instead.  These tests
+    pin that boundary: the active-unit rule the pivots are built from is
+    anchored to ``CURRENT_DATE`` and takes no interval parameters, so it cannot
+    be mistaken for a substitute for a historical Core query.
+    """
+
+    def test_the_active_rule_is_anchored_to_the_current_date(self):
+        assert "CURRENT_DATE" in _ACTIVE
+
+    def test_the_active_rule_takes_no_interval_parameters(self):
+        for definition in _mart_definitions(CORE_SCHEMA).values():
+            assert ":from" not in definition.select_sql
+            assert ":to" not in definition.select_sql
+
+    def test_every_pivot_filters_on_the_same_active_rule(self):
+        for definition in _mart_definitions(CORE_SCHEMA).values():
+            assert _ACTIVE in definition.select_sql

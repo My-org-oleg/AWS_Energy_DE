@@ -1,8 +1,9 @@
-# CI smoke gates (issue #14): two cheap invariants on push to `main` and on
-# pull requests — the Python code byte-compiles, and the pipeline and viz
-# container images still build. Never fetches or requires the private raw data
-# set, never runs the integration suite (that needs a PostGIS dev DB + the raw
-# data).
+# CI smoke gates (issue #14, extended by #10): three cheap invariants on push to
+# `main` and on pull requests — the Python code byte-compiles, the pipeline and
+# viz container images still build, and the Terraform configuration is formatted
+# and valid. Never fetches or requires the private raw data set, never runs the
+# integration suite (that needs a PostGIS dev DB + the raw data), never needs AWS
+# credentials.
 
 name: CI
 
@@ -39,3 +40,48 @@ jobs:
 
       - name: Build viz container image
         run: docker build -f Dockerfile.viz -t viz-app:ci .
+
+  terraform-validate:
+    name: Terraform fmt, validate + config tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.5'
+
+      # `validate` is the only step that knows the provider's schema: the
+      # configuration tests assert against parsed values, so a renamed or
+      # mistyped argument would pass them and fail the apply. No credentials and
+      # no backend — `init -backend=false` is enough to fetch the provider.
+      - name: Initialise providers only
+        run: terraform init -backend=false -input=false
+        working-directory: terraform
+
+      - name: Check formatting
+        run: terraform fmt -check -diff
+        working-directory: terraform
+
+      - name: Validate configuration
+        run: terraform validate
+        working-directory: terraform
+
+      # The configuration tests need no database, no raw data and no
+      # credentials, so they are cheap enough to be a gate. They are what pins
+      # the Terraform delivery contract to the worker's constants, which
+      # nothing else checks automatically. `requirements.txt` is installed
+      # because the test imports `etl.ingestion` for the real constants.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Terraform configuration tests
+        run: python -m pytest tests/test_terraform_config.py -q

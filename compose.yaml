@@ -1,4 +1,4 @@
-# Containerized ETL + viz stack (issues #13/#15/#28).
+# Containerized ETL + viz stack (issues #13/#15/#28/#8).
 #
 #   db        PostGIS server; created fresh from the image on first `up`. The
 #             image entrypoint enables the PostGIS extension in the default
@@ -10,18 +10,31 @@
 #             On a fresh db volume, docker/viz_reader.sql runs from
 #             /docker-entrypoint-initdb.d to provision the read-only
 #             `viz_reader` role the viz service connects as.
+#             PostGIS is NOT published to the host: the server stack keeps the
+#             database internal to the compose network (issue #8) — nginx is
+#             the only externally reachable surface.
 #
-#   pipeline  the `python -m etl` CLI in a container. `docker compose up`
-#             (and `run --rm pipeline`) executes the full pass (`run-all`)
-#             against `db`, which verifies every stage and fails loudly on drift.
+#   pipeline  the `python -m etl` CLI in a container running the server
+#             startup path (issue #8): `python -m etl startup` bootstraps the
+#             database preconditions, checks the fixed S3 keys, applies the
+#             current Boundary releases, enqueues the current Source object
+#             versions, and only then starts the ingestion worker. A fatal
+#             Boundary condition exits non-zero before the worker starts, so
+#             the restart policy crash-loops until the operator fixes it.
+#             The worker reads its input from S3/SQS/SNS, so this container
+#             mounts NO data volume — the private source-data seed volume
+#             stays off the server stack. Connection settings and AWS
+#             coordinates come from the environment (DATABASE_URL, S3_BUCKET,
+#             SQS_QUEUE_URL, SNS_TOPIC_ARN), supplied by the operator's
+#             shell/.env; nothing data- or secret-like is baked into the image
+#             or this file.
 #
 #   viz       the Streamlit + PyDeck app in its own container, always running
 #             (no auth). It reads the marts/core/service tables through the
-#             read-only `viz_reader` role via the VIZ_DATABASE_URL that the
-#             data-volume seed writes. For local development the app stays
-#             directly reachable at http://localhost:8501 via this file's twin
-#             `local_compose.yaml`; this (server) variant publishes no app
-#             port — nginx is the only externally reachable surface.
+#             read-only `viz_reader` role via VIZ_DATABASE_URL from the
+#             environment (the app reads it with a DATABASE_URL fallback,
+#             viz/data.py). This (server) variant publishes no app port —
+#             nginx is the only externally reachable surface.
 #
 #   nginx     the single external entry point on the server: reverse-proxies
 #             the viz container (nginx.conf → http://viz:8501, with websocket
@@ -31,23 +44,21 @@
 #             domain.
 #
 # Images: the pipeline and viz containers are pulled from Docker Hub
-# (`khvostenko/energy-etl`, `khvostenko/energy-viz`, both `latest` by default;
+# (`khvostenko/aws-energy-etl`, `khvostenko/aws-energy-viz`, both `latest` by default;
 # `${PIPELINE_IMAGE}` / `${VIZ_IMAGE}` override to pin another tag or registry).
 # The build-from-source twin of this file — the same stack that compiles both
 # images from this repo — is `build_compose.yaml`.
 #
-# The raw data set + connection settings live in the DETACHED named volume
-# `etl_data` (external: the seed script, scripts/seed_data_volume.sh, creates
-# it once per machine). The pipeline and viz containers mount it at /app/data
-# and the shared entrypoint sources /app/data/docker.env for DATABASE_URL /
-# VIZ_DATABASE_URL — nothing data- or secret-like is baked into the images or
-# this file, and the pipeline code is unchanged.
+# The local-dev twin of this file, `local_compose.yaml`, keeps the private
+# source-data seed volume (`etl_data`, external: the seed script,
+# scripts/seed_data_volume.sh, creates it once per machine) mounted at
+# /app/data and the `run-all` CLI workflow — that is the local workflow, not
+# the server deployment.
 #
-# db credentials: POSTGRES_* here and the DATABASE_URL written by the seed
-# script are a coupled pair — change both (and re-seed) if you deviate.
-# The viz_reader password follows suit: it is written by the seed script as
-# VIZ_DATABASE_URL and hard-coded in docker/viz_reader.sql — change both.
-# See docs/containerization.md.
+# db credentials: POSTGRES_* here and the DATABASE_URL the operator supplies
+# are a coupled pair — change both if you deviate. The viz_reader password
+# follows suit: it is hard-coded in docker/viz_reader.sql and supplied as
+# VIZ_DATABASE_URL — change both. See docs/containerization.md.
 
 name: energy-de-etl
 
@@ -61,8 +72,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
       POSTGRES_DB: ${POSTGRES_DB:-energy_de}
     restart: always
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+    # No ports: PostGIS stays internal to the compose network (issue #8) —
+    # the pipeline and viz reach it as `db:5432`, and nothing is published
+    # to the host. `docker compose exec db psql` still works without a
+    # published port.
     volumes:
       - db_data:/var/lib/postgresql/data
       # Provision the read-only viz_reader role on a fresh db volume. A
@@ -83,29 +96,39 @@ services:
       start_period: 10s
 
   pipeline:
-    image: ${PIPELINE_IMAGE:-khvostenko/energy-etl:latest}
-    # `run_all` is the Python function name; Click surfaces it as `run-all`
-    # (the same name the host CLI uses — the image behaviour is identical).
-    command: ["python", "-m", "etl", "run-all"]
+    image: ${PIPELINE_IMAGE:-khvostenko/aws-energy-etl:latest}
+    # The server startup path (issue #8): explicit bootstrap — database
+    # preconditions, fixed S3 key checks, current Boundary releases, current
+    # Source object versions enqueued — then the ingestion worker. A fatal
+    # Boundary condition exits non-zero before the worker starts.
+    command: ["python", "-m", "etl", "startup"]
     environment:
-      DATA_ENV_FILE: /app/data/docker.env
-    volumes:
-      - etl_data:/app/data
+      # Required, no defaults: the server stack fails fast without them
+      # rather than starting a worker that cannot reach its input.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL (the pipeline role's PostGIS URL)}
+      S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET (the versioned data bucket)}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:?set SQS_QUEUE_URL (the S3 ObjectCreated queue)}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:?set SNS_TOPIC_ARN (ingestion and DLQ alerts)}
+      # boto3 resolves a region from the environment first. Without it the
+      # worker would fall back to the instance metadata service, which the
+      # container cannot count on reaching, and fail to build its clients.
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?set AWS_DEFAULT_REGION (the deployment region)}
+    restart: always
+    # No volumes: the worker reads S3 through the event queue, so the private
+    # source-data seed volume is not mounted here (issue #8).
     depends_on:
       db:
         condition: service_healthy
 
   viz:
-    image: ${VIZ_IMAGE:-khvostenko/energy-viz:latest}
+    image: ${VIZ_IMAGE:-khvostenko/aws-energy-viz:latest}
     restart: always
     # "streamlit run viz/app.py --server.headless --server.address
     # 0.0.0.0 --server.port 8501" is the image's default command; nothing to
-    # override here. The entrypoint sources VIZ_DATABASE_URL from the seeded
-    # volume (the app reads it with a DATABASE_URL fallback, viz/data.py).
+    # override here. VIZ_DATABASE_URL comes from the environment (the app
+    # reads it with a DATABASE_URL fallback, viz/data.py).
     environment:
-      DATA_ENV_FILE: /app/data/docker.env
-    volumes:
-      - etl_data:/app/data
+      VIZ_DATABASE_URL: ${VIZ_DATABASE_URL:?set VIZ_DATABASE_URL (the read-only viz_reader URL)}
     depends_on:
       db:
         condition: service_healthy
@@ -142,6 +165,3 @@ services:
 
 volumes:
   db_data:
-  etl_data:
-    external: true
-    name: ${ETL_DATA_VOLUME:-etl_data}

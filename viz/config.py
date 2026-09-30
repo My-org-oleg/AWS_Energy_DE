@@ -80,7 +80,8 @@ DEFAULT_SOURCES = ("bio", "gas", "hydro", "solar", "wind", "storage")
 DEFAULT_CHOROPLETH = True
 
 # Active-units timescope default: every unit commissioned up to today counts,
-# and nothing is excluded for decommissioning before the epoch default.
+# and nothing is excluded for decommissioning before the epoch default.  The
+# upper bound is today, so a unit commissioned after today is not Active yet.
 TIMESCOPE_START = date(1900, 1, 1)
 
 

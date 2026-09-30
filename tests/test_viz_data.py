@@ -1,4 +1,4 @@
-"""Unit tests for the viz data-access seams (issues #23, #25, render-opt).
+"""Unit tests for the viz data-access seams (issues #23, #25, render-opt, #9).
 
 Seams live in `viz.data`: the engine selection (`VIZ_DATABASE_URL` with a
 `DATABASE_URL` fallback), the standby detection (`missing_core_tables`), the
@@ -11,6 +11,12 @@ engines, the standby tests drive a stub engine whose rows mimic
 `information_schema`, and the fetch tests drive recording or row-returning
 stub engines.  `fetch_units`'s pandas orchestration stubs the `run_frame`
 seam, so no rows ever hit a real reader.
+
+Issue #9 covers the timescope rule itself: the unit query's closed interval
+(commissioned on/after `:from` and on/before `:to`, still running at `:to`),
+that both Core kinds share it, that the marts are never read as a substitute,
+and that Source membership is never joined.  `tests/test_viz_timescope.py`
+drives the same rule against real Core rows to prove the endpoints.
 """
 
 import os
@@ -23,6 +29,7 @@ from sqlalchemy import create_engine
 
 from viz import data as data_module
 from viz.data import (
+    ACTIVE_UNIT_PREDICATE,
     CORE_VIS_TABLES,
     STORAGE_COLUMNS_SQL,
     UNIT_COLUMNS,
@@ -74,7 +81,12 @@ class TestEngineSelection:
         assert str(engine.url) == str(expected.url)
 
     def test_prefers_viz_database_url(self, monkeypatch):
-        monkeypatch.setenv("VIZ_DATABASE_URL", "postgresql://viz_reader@localhost:5432/energy_de")
+        # The driver is explicit because requirements-viz.txt installs psycopg2
+        # while SQLAlchemy 2.1 resolves a bare postgresql:// to psycopg3.
+        monkeypatch.setenv(
+            "VIZ_DATABASE_URL",
+            "postgresql+psycopg2://viz_reader@localhost:5432/energy_de",
+        )
         engine = get_viz_engine()
         assert engine.url.username == "viz_reader"
         assert engine.url.database == "energy_de"
@@ -151,7 +163,7 @@ class TestUnitsQuery:
             "decommissioning_date, longitude, latitude, state, district "
             "FROM core.generators "
             "WHERE energy_source = ANY(:sources) "
-            "AND commissioning_date >= :from "
+            "AND commissioning_date BETWEEN :from AND :to "
             "AND (decommissioning_date IS NULL OR decommissioning_date >= :to)"
         )
         assert params == {
@@ -182,13 +194,56 @@ class TestUnitsQuery:
             active_from=date(1990, 1, 1),
             active_to=date(2010, 1, 1),
         )
-        assert "commissioning_date >= :from" in sql
+        assert "commissioning_date BETWEEN :from AND :to" in sql
         assert "decommissioning_date IS NULL OR decommissioning_date >= :to" in sql
         assert params == {
             "sources": ["solar"],
             "from": date(1990, 1, 1),
             "to": date(2010, 1, 1),
         }
+
+    def test_both_core_kinds_are_fetched_under_the_one_timescope_predicate(self):
+        # One rule, both kinds: the same predicate constant is interpolated
+        # into the generator and the storage query (issue #9).
+        for table, columns, sources in (
+            ("generators", UNIT_COLUMNS_SQL, ("solar",)),
+            ("storages", STORAGE_COLUMNS_SQL, ("storage",)),
+        ):
+            sql, _ = units_query(
+                table,
+                columns,
+                sources=sources,
+                active_from=date(1990, 1, 1),
+                active_to=date(2010, 1, 1),
+            )
+            assert ACTIVE_UNIT_PREDICATE in sql
+
+    def test_the_unit_query_reads_core_and_never_the_marts(self):
+        # The marts are current-date pivots and cannot answer an interval
+        # (ADR 0003), so the timescope fetch reads Core only.
+        sql, params = units_query(
+            "generators",
+            UNIT_COLUMNS_SQL,
+            sources=("solar",),
+            active_from=date(1990, 1, 1),
+            active_to=date(2010, 1, 1),
+        )
+        assert sql.startswith("SELECT ") and "FROM core.generators" in sql
+        assert "marts" not in sql
+        assert set(params) == {"sources", "from", "to"}
+
+    def test_the_unit_query_never_joins_source_memberships(self):
+        # A unit a newer Source snapshot dropped stays in Core and stays
+        # Active by its dates; membership absence must not filter it out.
+        sql, _ = units_query(
+            "generators",
+            UNIT_COLUMNS_SQL,
+            sources=("solar",),
+            active_from=date(1990, 1, 1),
+            active_to=date(2010, 1, 1),
+        )
+        assert "source_memberships" not in sql
+        assert " JOIN " not in sql.upper()
 
     def test_area_column_broadcasts_the_area_attribute_as_name(self):
         sql, params = units_query(
@@ -252,13 +307,13 @@ class TestFetchUnits:
             "decommissioning_date, longitude, latitude, state, district, "
             "state AS name FROM core.generators "
             "WHERE energy_source = ANY(:sources) "
-            "AND commissioning_date >= :from "
+            "AND commissioning_date BETWEEN :from AND :to "
             "AND (decommissioning_date IS NULL OR decommissioning_date >= :to)",
             "SELECT energy_source, installed_capacity, commissioning_date, "
             "decommissioning_date, longitude, latitude, state, district, "
             "storage_capacity, state AS name FROM core.storages "
             "WHERE energy_source = ANY(:sources) "
-            "AND commissioning_date >= :from "
+            "AND commissioning_date BETWEEN :from AND :to "
             "AND (decommissioning_date IS NULL OR decommissioning_date >= :to)",
         ]
         assert [params for _, params in calls] == [
@@ -291,7 +346,7 @@ class TestFetchUnits:
             "decommissioning_date, longitude, latitude, state, district "
             "FROM core.generators "
             "WHERE energy_source = ANY(:sources) "
-            "AND commissioning_date >= :from "
+            "AND commissioning_date BETWEEN :from AND :to "
             "AND (decommissioning_date IS NULL OR decommissioning_date >= :to)"
         ]
 

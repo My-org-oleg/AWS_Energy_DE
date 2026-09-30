@@ -161,6 +161,50 @@ else
     printf 'PASS: compose has no metabase service\n'
 fi
 
+step "Server variant deployment contract (compose.yaml, issue #8)"
+# The server stack must not mount the private source-data seed volume, must
+# not publish PostGIS, and must run the explicit startup-before-worker path.
+# `config` only interpolates and renders — no stack, data, or AWS needed —
+# so the required settings get dummy values here.
+server_config="$(DATABASE_URL=postgresql://etl:etl@db:5432/energy_de \
+    S3_BUCKET=dummy SQS_QUEUE_URL=https://dummy SNS_TOPIC_ARN=arn:dummy \
+    AWS_DEFAULT_REGION=eu-central-1 \
+    VIZ_DATABASE_URL=postgresql://viz_reader:viz@db:5432/energy_de \
+    docker compose -f compose.yaml config)" || fail "compose.yaml does not render"
+if echo "$server_config" | grep -q "etl_data"; then
+    fail "server stack still references the etl_data seed volume"
+else
+    printf 'PASS: server stack mounts no source-data seed volume\n'
+fi
+# nginx's 80 is the one allowed publication; anything else (PostGIS on 5432,
+# the viz app on 8501) would be a leaked internal surface.
+published_ports="$(echo "$server_config" | grep 'published:' | tr -d ' \"' | cut -d: -f2 | sort -u)"
+if [ "$published_ports" = "80" ]; then
+    printf 'PASS: server stack publishes only nginx (PostGIS stays internal)\n'
+else
+    fail "server stack publishes unexpected ports: $published_ports"
+fi
+if echo "$server_config" | grep -q "startup"; then
+    printf 'PASS: server pipeline runs the startup-before-worker path\n'
+else
+    fail "server pipeline command is not the startup path"
+fi
+if echo "$server_config" | grep -q "DATABASE_URL"; then
+    printf 'PASS: server stack takes its settings from the environment\n'
+else
+    fail "server stack does not pass DATABASE_URL from the environment"
+fi
+# Startup order at the compose level: the pipeline (bootstrap + worker) may
+# not start before PostGIS is healthy. The behavioural order — bootstrap
+# before the worker, fatal Boundary refusal — is verified by
+# tests/test_ingestion.py against real PostGIS with fake AWS adapters.
+pipeline_block="$(echo "$server_config" | sed -n '/^  pipeline:/,/^  [a-z]/p')"
+if echo "$pipeline_block" | grep -q "service_healthy"; then
+    printf 'PASS: server pipeline starts only after db is healthy\n'
+else
+    fail "server pipeline does not wait for a healthy db"
+fi
+
 step "Bringing up the viz service (Streamlit, port ${VIZ_PORT})"
 docker compose up -d --wait viz
 

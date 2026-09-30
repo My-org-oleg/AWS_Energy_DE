@@ -1,0 +1,21 @@
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "${docker_container_log_glob}",
+            "log_group_name": "${worker_log_group}",
+            "log_stream_name": "container",
+            "publish_multi_logs": true
+          },
+          {
+            "file_path": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+            "log_group_name": "${agent_log_group}",
+            "log_stream_name": "amazon-cloudwatch-agent"
+          }
+        ]
+      }
+    }
+  }
+}

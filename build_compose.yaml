@@ -1,47 +1,29 @@
-# Containerized ETL + viz stack (issues #13/#15/#28).
+# Containerized ETL + viz stack (issues #13/#15/#28/#8) — build-from-source
+# twin of the server variant.
 #
-#   db        PostGIS server; created fresh from the image on first `up`. The
-#             image entrypoint enables the PostGIS extension in the default
-#             database (POSTGRES_DB), so no extra DDL is needed.
-#             imresamu/postgis is a multi-arch (amd64 + arm64) rebuild of the
-#             official postgis/postgis images, so the database runs natively on
-#             Apple Silicon instead of x86 emulation (postgis/postgis is
-#             amd64-only). Same PostGIS behaviour, same postgres entrypoint.
-#             On a fresh db volume, docker/viz_reader.sql runs from
-#             /docker-entrypoint-initdb.d to provision the read-only
-#             `viz_reader` role the viz service connects as.
+# Identical to `compose.yaml` (the server/deploy variant) except that the
+# pipeline and viz images are compiled from this repo (Dockerfile /
+# Dockerfile.viz) instead of pulled from Docker Hub — used for testing local
+# image changes without publishing. The deployment contract is the same:
 #
-#   pipeline  the `python -m etl` CLI in a container. `docker compose up`
-#             (and `run --rm pipeline`) executes the full pass (`run-all`)
-#             against `db`, which verifies every stage and fails loudly on drift.
+#   db        PostGIS, NOT published to the host — internal to the compose
+#             network only (issue #8).
+#   pipeline  `python -m etl startup`: explicit bootstrap (database
+#             preconditions, fixed S3 key checks, current Boundary releases,
+#             current Source object versions enqueued), then the ingestion
+#             worker. No data volume mounted — the worker reads S3/SQS/SNS,
+#             with settings from the environment.
+#   viz       the Streamlit + PyDeck app, reading as the read-only
+#             `viz_reader` role via VIZ_DATABASE_URL from the environment;
+#             no app port published.
+#   nginx     the single external entry point: port 80 → viz:8501.
 #
-#   viz       the Streamlit + PyDeck app in its own container, always running
-#             (no auth). It reads the marts/core/service tables through the
-#             read-only `viz_reader` role via the VIZ_DATABASE_URL that the
-#             data-volume seed writes. For local development the app stays
-#             directly reachable at http://localhost:8501 via this file's twin
-#             `local_compose.yaml`; this (server) variant publishes no app
-#             port — nginx is the only externally reachable surface.
+# The local-dev twin, `local_compose.yaml`, keeps the private source-data
+# seed volume (`etl_data`) mounted and the `run-all` CLI workflow.
 #
-#   nginx     the single external entry point on the server: reverse-proxies
-#             the viz container (nginx.conf → http://viz:8501, with websocket
-#             upgrade headers for Streamlit's live runtime) so Streamlit never
-#             needs its own published port. Edit `docker/nginx.conf` and the
-#             `nginx` service here to pin hostname/TLS if you serve from a real
-#             domain.
-#
-# The raw data set + connection settings live in the DETACHED named volume
-# `etl_data` (external: the seed script, scripts/seed_data_volume.sh, creates
-# it once per machine). The pipeline and viz containers mount it at /app/data
-# and the shared entrypoint sources /app/data/docker.env for DATABASE_URL /
-# VIZ_DATABASE_URL — nothing data- or secret-like is baked into the images or
-# this file, and the pipeline code is unchanged.
-#
-# db credentials: POSTGRES_* here and the DATABASE_URL written by the seed
-# script are a coupled pair — change both (and re-seed) if you deviate.
-# The viz_reader password follows suit: it is written by the seed script as
-# VIZ_DATABASE_URL and hard-coded in docker/viz_reader.sql — change both.
-# See docs/containerization.md.
+# Required environment (no defaults — the stack fails fast without them):
+# DATABASE_URL, S3_BUCKET, SQS_QUEUE_URL, SNS_TOPIC_ARN, AWS_DEFAULT_REGION,
+# VIZ_DATABASE_URL. See docs/containerization.md.
 
 name: energy-de-etl
 
@@ -55,8 +37,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
       POSTGRES_DB: ${POSTGRES_DB:-energy_de}
     restart: always
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+    # No ports: PostGIS stays internal to the compose network (issue #8).
     volumes:
       - db_data:/var/lib/postgresql/data
       # Provision the read-only viz_reader role on a fresh db volume. A
@@ -78,13 +59,17 @@ services:
 
   pipeline:
     build: .
-    # `run_all` is the Python function name; Click surfaces it as `run-all`
-    # (the same name the host CLI uses — the image behaviour is identical).
-    command: ["python", "-m", "etl", "run-all"]
+    # The server startup path (issue #8): explicit bootstrap, then the worker.
+    command: ["python", "-m", "etl", "startup"]
     environment:
-      DATA_ENV_FILE: /app/data/docker.env
-    volumes:
-      - etl_data:/app/data
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL (the pipeline role's PostGIS URL)}
+      S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET (the versioned data bucket)}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:?set SQS_QUEUE_URL (the S3 ObjectCreated queue)}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:?set SNS_TOPIC_ARN (ingestion and DLQ alerts)}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?set AWS_DEFAULT_REGION (the deployment region)}
+    restart: always
+    # No volumes: the worker reads S3 through the event queue, so the private
+    # source-data seed volume is not mounted here (issue #8).
     depends_on:
       db:
         condition: service_healthy
@@ -96,12 +81,10 @@ services:
     restart: always
     # "streamlit run viz/app.py --server.headless --server.address
     # 0.0.0.0 --server.port 8501" is the image's default command; nothing to
-    # override here. The entrypoint sources VIZ_DATABASE_URL from the seeded
-    # volume (the app reads it with a DATABASE_URL fallback, viz/data.py).
+    # override here. VIZ_DATABASE_URL comes from the environment (the app
+    # reads it with a DATABASE_URL fallback, viz/data.py).
     environment:
-      DATA_ENV_FILE: /app/data/docker.env
-    volumes:
-      - etl_data:/app/data
+      VIZ_DATABASE_URL: ${VIZ_DATABASE_URL:?set VIZ_DATABASE_URL (the read-only viz_reader URL)}
     depends_on:
       db:
         condition: service_healthy
@@ -138,6 +121,3 @@ services:
 
 volumes:
   db_data:
-  etl_data:
-    external: true
-    name: ${ETL_DATA_VOLUME:-etl_data}

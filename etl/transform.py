@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -8,6 +7,9 @@ import time
 import geopandas as gpd
 import numpy
 import pandas
+from psycopg2.extras import execute_values
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from etl.config import SOURCE_NAMES, get_engine
 from etl.config import (
@@ -20,10 +22,16 @@ from etl.config import (
     STAGING_SCHEMA,
     SYNTHETIC_ID_PREFIX,
 )
-from etl.db_utils import _create_staging_tables, _ensure_schema, _table_exists
+from etl.db_utils import (
+    _create_staging_tables,
+    _drop_staging_tables,
+    _ensure_schema,
+    _table_exists,
+)
 from etl.reports import TransformReport
+from etl.source_data import SourceValidationError, synthetic_unit_ids
 from etl.utils import _latest_table_version
-from etl.verify import _verify_transform
+from etl.verify import _verify_membership_matches_staging, _verify_transform
 
 log = logging.getLogger(__name__)
 
@@ -53,19 +61,52 @@ def transform_sources(*sources: str) -> TransformReport:
     """
     if not sources or "all" in sources:
         sources = SOURCE_NAMES
-    reports = [_transform_source(s) for s in sources]
+    reports = [_reported(s) for s in sources]
     return _merge_transform_reports(sources, reports)
 
 
-def _transform_source(source: str) -> TransformReport:
-    """Transform the latest raw version of one source into its staging tables."""
+def _reported(source: str) -> TransformReport:
+    """Transform one source for the report API, which reports rather than rejects.
+
+    The event path treats a file that fails its own validation as a rejected
+    object version; this path is a hand-run over the latest raw version, so the
+    verdict belongs in the report the operator is reading.
+    """
+    try:
+        return _transform_source(source)
+    except SourceValidationError as error:
+        return TransformReport(source=source, errors=[f"Transform failed: {error}"])
+
+
+def transform_source_snapshot(
+    source: str,
+    raw_table: str,
+    *,
+    engine: Engine,
+    ingestion_run_id,
+) -> TransformReport:
+    return _transform_source(
+        source,
+        engine=engine,
+        raw_table=raw_table,
+        ingestion_run_id=ingestion_run_id,
+    )
+
+
+def _transform_source(
+    source: str,
+    *,
+    engine: Engine | None = None,
+    raw_table: str | None = None,
+    ingestion_run_id=None,
+) -> TransformReport:
     report = TransformReport(source=source)
     start = time.perf_counter()
     try:
-        engine = get_engine()
+        engine = engine or get_engine()
         _ensure_schema(engine, STAGING_SCHEMA)
 
-        raw_table = _latest_table_version(engine, source)
+        raw_table = raw_table or _latest_table_version(engine, source)
         if raw_table is None:
             report.errors.append(
                 f"raw tables missing for source {source!r}; "
@@ -111,14 +152,9 @@ def _transform_source(source: str) -> TransformReport:
 
         log.info("Spatial join against boundary levels 1/2/3...")
         t = time.perf_counter()
-        for level, col in BOUNDARY_LEVEL_COLUMNS.items():
-            layer = boundaries[boundaries["level"] == level][["name", "geometry"]]
-            joined = (
-                df[["unit_id", "geometry"]]
-                .sjoin(layer, how="left", predicate="intersects")
-                .drop_duplicates(subset="unit_id", keep="first")
-            )
-            df[col] = df["unit_id"].map(joined.set_index("unit_id")["name"])
+        geography = enrich_geography(df, boundaries)
+        for col in BOUNDARY_LEVEL_COLUMNS.values():
+            df[col] = geography[col]
             report.join_unmapped[col] = int(df[col].isna().sum())
         log.info(
             "Join coverage %s, time %.3fs",
@@ -170,14 +206,38 @@ def _transform_source(source: str) -> TransformReport:
         report.rows_written = len(df)
         log.info("Staging written, time %.3fs", time.perf_counter() - t)
 
+        if ingestion_run_id is not None:
+            _record_source_memberships(
+                engine,
+                source=source,
+                ingestion_run_id=ingestion_run_id,
+            )
+
         log.info("Verifying transform...")
         t = time.perf_counter()
         report.errors = _verify_transform(engine, source, report)
+        if ingestion_run_id is not None:
+            membership_errors, _ = _verify_membership_matches_staging(
+                engine,
+                source=source,
+                ingestion_run_id=ingestion_run_id,
+            )
+            report.errors.extend(membership_errors)
         log.info("Verification done, time %.3fs", time.perf_counter() - t)
 
+    except SourceValidationError:
+        # The version is rejected rather than retried (issue #7), so the caller
+        # has to be able to see the verdict; what was staged for it is still not
+        # verified and is thrown away.
+        if ingestion_run_id is not None:
+            _discard_unverified_staging(engine, source)
+        raise
     except Exception as e:
         report.errors.append(f"Transform failed: {e}")
         log.exception("Transform failed for %s", source)
+
+    if report.errors and ingestion_run_id is not None:
+        _discard_unverified_staging(engine, source)
 
     report.total_time = time.perf_counter() - start
     if report.errors:
@@ -188,6 +248,143 @@ def _transform_source(source: str) -> TransformReport:
     log.info("Total time: %.3fs", report.total_time)
 
     return report
+
+
+def enrich_geography(
+    points: gpd.GeoDataFrame, boundaries: gpd.GeoDataFrame
+) -> pandas.DataFrame:
+    """Derive state, region and district for every point from the boundary layer.
+
+    The single definition of administrative geography, shared by the transform
+    and by the rebuild after a Boundary release so the two cannot drift. A
+    point takes the name of the level-1/2/3 polygon it intersects; one on a
+    shared border takes the alphabetically first name, so the result is
+    deterministic; one outside every polygon of a level gets null.
+    """
+    frame = gpd.GeoDataFrame(
+        {"_row": range(len(points))}, geometry=points.geometry.values, crs=points.crs
+    )
+    result = pandas.DataFrame(index=points.index)
+    for level, column in BOUNDARY_LEVEL_COLUMNS.items():
+        layer = boundaries.loc[boundaries["level"] == level, ["name", "geometry"]]
+        joined = frame.sjoin(layer, how="left", predicate="intersects")
+        names = joined.groupby("_row")["name"].min()
+        result[column] = pandas.Series(
+            names.reindex(range(len(points))).to_numpy(), index=points.index, dtype=object
+        ).where(lambda values: values.notna(), None)
+    return result
+
+
+def reenrich_staging(
+    engine: Engine, source: str, boundaries: gpd.GeoDataFrame
+) -> tuple[int, list[str]]:
+    """Rederive a Source's staging geography in place after a Boundary release.
+
+    Only state, region and district change: identity, quality and properties
+    do not depend on boundaries. Returns (rows updated, verification errors).
+    """
+    staged = gpd.read_postgis(
+        f"SELECT unit_id, geometry FROM {STAGING_SCHEMA}.{source}",
+        engine,
+        geom_col="geometry",
+    )
+    geography = enrich_geography(staged, boundaries)
+    records = list(
+        zip(
+            staged["unit_id"],
+            geography["state"],
+            geography["region"],
+            geography["district"],
+        )
+    )
+    with engine.begin() as connection:
+        if records:
+            execute_values(
+                connection.connection.cursor(),
+                f"UPDATE {STAGING_SCHEMA}.{source} s "
+                "SET state = v.state, region = v.region, district = v.district "
+                "FROM (VALUES %s) AS v(unit_id, state, region, district) "
+                "WHERE s.unit_id = v.unit_id",
+                records,
+                template="(%s, %s::text, %s::text, %s::text)",
+                page_size=2000,
+            )
+    stored = pandas.read_sql(
+        text(f"SELECT unit_id, state, region, district FROM {STAGING_SCHEMA}.{source}"),
+        engine,
+    ).set_index("unit_id")
+    expected = geography.set_index(staged["unit_id"])
+    errors = []
+    mismatched = [
+        unit_id
+        for unit_id, row in expected.iterrows()
+        if tuple(_none(v) for v in stored.loc[unit_id]) != tuple(_none(v) for v in row)
+    ]
+    if mismatched:
+        errors.append(
+            f"Staging geography of {source} not rebuilt for {len(mismatched)} units"
+        )
+    return len(records), errors
+
+
+def _none(value):
+    return None if value is None or pandas.isna(value) else value
+
+
+def _discard_unverified_staging(engine: Engine | None, source: str) -> None:
+    """Drop a Source's staging after a failed snapshot transform.
+
+    A snapshot load upserts every staging table of its Core kind, so a staging
+    table has to mean "the last transform of this Source was verified".
+    Otherwise a snapshot that was written but failed verification would reach
+    Core through the next successful Source of the same kind. Dropping it
+    leaves that Source's Core units retained until a good snapshot arrives.
+    """
+    if engine is None:
+        return
+    try:
+        _drop_staging_tables(engine, source)
+    except Exception:
+        log.exception("Could not discard unverified staging for %s", source)
+
+
+def _record_source_memberships(
+    engine: Engine,
+    *,
+    source: str,
+    ingestion_run_id,
+) -> None:
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                f"SELECT unit_id, reference_id, bad_quality "
+                f"FROM {STAGING_SCHEMA}.{source}"
+            )
+        ).mappings().all()
+    statement = text(
+        f"DELETE FROM {SERVICE_SCHEMA}.source_memberships WHERE run_id = :run_id"
+    )
+    with engine.begin() as connection:
+        connection.execute(statement, {"run_id": str(ingestion_run_id)})
+        if rows:
+            connection.execute(
+                text(
+                    f"INSERT INTO {SERVICE_SCHEMA}.source_memberships "
+                    "(run_id, energy_source, unit_key, reference_id, bad_quality) "
+                    "VALUES (:run_id, :energy_source, :unit_key, :reference_id, "
+                    ":bad_quality)"
+                ),
+                [
+                    {
+                        "run_id": str(ingestion_run_id),
+                        "energy_source": source,
+                        "unit_key": row["unit_id"],
+                        "reference_id": row["reference_id"],
+                        "bad_quality": row["bad_quality"],
+                    }
+                    for row in rows
+                ],
+            )
 
 
 def _merge_transform_reports(
@@ -234,34 +431,22 @@ def _merge_transform_reports(
 
 
 def _unit_ids(df: pandas.DataFrame, source: str) -> pandas.Series:
-    """Build the staging natural key per row.
-
-    Rows carrying a reference_id get '<source>_<reference_id>'; rows without
-    one (none in bio) get a synthetic hash identity derived from the row's own
-    attributes and recognized by the 'syn_' prefix (ADR 0001, staging-only).
-    """
-    ids = (source + "_" + df["reference_id"].astype("string")).astype("string")
     missing = df["reference_id"].isna()
-    if missing.any():
-        rows = df.loc[missing]
-        synthetic = rows.apply(
-            lambda r: _synthetic_unit_id(
-                source,
-                r["x_coordinates"],
-                r["y_coordinates"],
-                r["installed_capacity"],
-                r["commissioning_date"],
-            ),
-            axis=1,
+    locations = df["secondary_attributes"].map(json.loads).map(
+        lambda value: value.get("location")
+    )
+    if missing.any() and locations[missing].isna().any():
+        raise SourceValidationError(
+            "Rows without reference_id require a location"
         )
-        ids.loc[missing] = synthetic.to_numpy()
-    return ids
-
-
-def _synthetic_unit_id(source: str, x, y, capacity, commissioning) -> str:
-    """Stable synthetic identity from a unit's own attributes (ADR 0001)."""
-    payload = "|".join(str(v) for v in (source, x, y, capacity, commissioning))
-    return SYNTHETIC_ID_PREFIX + hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return synthetic_unit_ids(
+        source=source,
+        reference_ids=df["reference_id"],
+        locations=locations,
+        x=df["x_coordinates"],
+        y=df["y_coordinates"],
+        geo_accuracy=df["geo_accuracy"],
+    )
 
 
 def _quality_reasons(df: pandas.DataFrame) -> pandas.Series:

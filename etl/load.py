@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
+import geopandas as gpd
 import pandas
 from psycopg2.extras import execute_values
 from sqlalchemy import text
@@ -26,10 +26,10 @@ from etl.config import (
     ONSHORE_SOURCES,
     OUTSIDE_LOCATION_COLLISION_REASON,
     SEA_REGIONS,
+    SERVICE_SCHEMA,
     STAGING_GENERATOR_SOURCES,
     STAGING_SCHEMA,
     STORAGE_CAPACITY_COLLISION_REASON,
-    SYNTHETIC_ID_PREFIX,
 )
 from etl.db_utils import (
     _create_core_generators,
@@ -38,9 +38,19 @@ from etl.db_utils import (
     _table_exists,
 )
 from etl.reports import LoadReport
-from etl.verify import _verify_load_generators, _verify_load_storages
+from etl.source_data import synthetic_identity
+from etl.transform import enrich_geography
+from etl.verify import (
+    _verify_load_generators,
+    _verify_load_storages,
+    _verify_membership_matches_staging,
+)
 
 log = logging.getLogger(__name__)
+
+
+# Value columns every Core kind is verified on after a snapshot load.
+_SHARED_VERIFIED_COLUMNS = ("installed_capacity", "reference_date")
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,9 @@ class _CoreKind:
     check_storage_capacity: bool
     verifier: Callable[[Engine, LoadReport], list[str]]
     create_table: Callable[[Engine], None]
+    # Staging value columns a snapshot load must carry into Core unchanged;
+    # checked row by row after an authoritative load (issue #4).
+    verified_columns: tuple[str, ...] = ()
 
 
 GENERATOR_KIND = _CoreKind(
@@ -90,6 +103,7 @@ GENERATOR_KIND = _CoreKind(
     check_storage_capacity=False,
     verifier=_verify_load_generators,
     create_table=_create_core_generators,
+    verified_columns=_SHARED_VERIFIED_COLUMNS,
 )
 
 STORAGE_KIND = _CoreKind(
@@ -120,6 +134,7 @@ STORAGE_KIND = _CoreKind(
     check_storage_capacity=True,
     verifier=_verify_load_storages,
     create_table=_create_core_storages,
+    verified_columns=(*_SHARED_VERIFIED_COLUMNS, "storage_type", "storage_capacity"),
 )
 
 
@@ -133,16 +148,51 @@ def load_storages() -> LoadReport:
     return _load(kind=STORAGE_KIND)
 
 
-def _load(kind: _CoreKind) -> LoadReport:
+def load_source_snapshot(
+    source: str,
+    *,
+    engine: Engine,
+    ingestion_run_id,
+) -> LoadReport:
+    kind = STORAGE_KIND if source == "storage" else GENERATOR_KIND
+    return _load(
+        kind=kind,
+        engine=engine,
+        snapshot_source=source,
+        ingestion_run_id=ingestion_run_id,
+    )
+
+
+def ensure_core_tables(engine: Engine) -> None:
+    """Create both core unit tables if they do not exist yet.
+
+    Marts read core.generators and core.storages together, so a Source
+    snapshot that only ever carries one unit kind still needs both tables to
+    exist. Schema resolution stays in this module so callers never repeat it.
+    """
+    _ensure_schema(engine, CORE_SCHEMA)
+    for kind in (GENERATOR_KIND, STORAGE_KIND):
+        if not _table_exists(engine, kind.core_table, CORE_SCHEMA):
+            kind.create_table(engine)
+
+
+def _load(
+    kind: _CoreKind,
+    *,
+    engine: Engine | None = None,
+    snapshot_source: str | None = None,
+    ingestion_run_id=None,
+) -> LoadReport:
     """Consolidate a kind's good staging rows into its core table.
 
     Reads the good (bad_quality=false) rows from the kind's staging tables
     and consolidates them into the core table with a serial surrogate key.
-    The first load creates the table and INSERTs every good row; later loads
-    are incremental: a staging row whose record identity matches an existing
-    core row is UPDATEd in place only when its reference_date is fresher, a
-    staler row is skipped, and an unmatched row is INSERTed. Core unit_ids
-    are never regenerated.
+    Every load is a complete pass over the kind: a staging row whose record
+    identity matches an existing core row is UPDATEd in place whatever its
+    reference_date says, an unmatched row is INSERTed, and a core row that
+    the staging tables no longer carry is left untouched. Core unit_ids are
+    never regenerated and core rows are never deleted, so historical units
+    survive snapshot replacement.
 
     After the upsert, collision checks run against the core geometry and are
     then refreshed (flags reset, collision links cleared, re-written from
@@ -156,13 +206,21 @@ def _load(kind: _CoreKind) -> LoadReport:
     report = LoadReport(target=kind.core_table)
     start = time.perf_counter()
     try:
-        engine = get_engine()
+        engine = engine or get_engine()
 
-        missing = [
-            t for t in kind.staging_sources
-            if not _table_exists(engine, t, STAGING_SCHEMA)
-        ]
-        if missing:
+        present_sources = tuple(
+            source
+            for source in kind.staging_sources
+            if _table_exists(engine, source, STAGING_SCHEMA)
+        )
+        # A snapshot load needs its own source plus whatever else of the kind is
+        # already transformed, so Core stays complete. A batch load needs all of
+        # them, because the local CLI transform stage is expected to have run.
+        expected = (
+            {snapshot_source} if snapshot_source is not None
+            else set(kind.staging_sources)
+        )
+        if not present_sources or not expected <= set(present_sources):
             report.errors.append(
                 f"staging tables missing for {report.target}; "
                 "run 'python -m etl transform' first"
@@ -181,9 +239,9 @@ def _load(kind: _CoreKind) -> LoadReport:
 
         log.info("Reading staging rows for %s...", report.target)
         t = time.perf_counter()
-        staging_df = _read_staging(engine, kind)
+        staging_df = _read_staging(engine, kind, present_sources)
+        report.bad_rows_dropped = _bad_quality_count(engine, kind, present_sources)
         report.rows_read = len(staging_df)
-        report.bad_rows_dropped = _bad_quality_count(engine, kind)
         log.info(
             "%d good staging rows, %d bad dropped, time %.3fs",
             report.rows_read,
@@ -194,23 +252,34 @@ def _load(kind: _CoreKind) -> LoadReport:
         log.info("Building core identity lookup...")
         t = time.perf_counter()
         core_lookup, existing_count = _build_core_lookup(engine, kind)
+        known_before = frozenset(core_lookup)
         log.info(
             "%d existing core rows, time %.3fs", existing_count, time.perf_counter() - t
         )
 
-        log.info("Partitioning staging into insert/update/skip...")
+        log.info("Partitioning staging into insert/update...")
         t = time.perf_counter()
         max_existing_id = _max_unit_id(engine, kind)
-        insert_df, update_df, skip_df = _partition_staging(engine, staging_df, core_lookup, kind)
-        _apply_upsert(engine, insert_df, update_df, kind)
+        insert_df, update_df = _partition_staging(
+            engine,
+            staging_df,
+            core_lookup,
+            kind,
+        )
+        staging_to_core = _apply_upsert(
+            engine,
+            insert_df,
+            update_df,
+            kind,
+        )
         report.rows_inserted = len(insert_df)
         report.rows_updated = len(update_df)
-        report.rows_skipped = len(skip_df)
+        report.rows_retained = existing_count - len(update_df)
         log.info(
-            "Inserted %d, updated %d, skipped %d, time %.3fs",
+            "Inserted %d, updated %d, retained %d, time %.3fs",
             report.rows_inserted,
             report.rows_updated,
-            report.rows_skipped,
+            report.rows_retained,
             time.perf_counter() - t,
         )
 
@@ -266,10 +335,14 @@ def _load(kind: _CoreKind) -> LoadReport:
         log.info("Transferring normalized properties...")
         t = time.perf_counter()
         if first_load or affected:
-            staging_to_core = _staging_to_core_unit_map(engine, kind)
             report.properties_count, report.links_count = _transfer_properties(
-                engine, staging_to_core, affected_ids=affected, kind=kind
+                engine,
+                staging_to_core,
+                kind,
+                present_sources,
+                affected_ids=affected,
             )
+
         else:
             log.info("No changes — skipping property transfer")
         log.info(
@@ -281,19 +354,27 @@ def _load(kind: _CoreKind) -> LoadReport:
 
         log.info("Verifying load...")
         t = time.perf_counter()
-        report.errors = kind.verifier(engine, report)
+        if snapshot_source is None:
+            report.errors = kind.verifier(engine, report)
+        else:
+            report.errors = _verify_authoritative_source(
+                engine,
+                kind,
+                source=snapshot_source,
+                ingestion_run_id=ingestion_run_id,
+                known_before=known_before,
+            )
         log.info("Verification done, time %.3fs", time.perf_counter() - t)
 
         # Idempotency check: run upsert again, counts should not change.
         log.info("Idempotency check...")
         t = time.perf_counter()
         core_lookup2, _ = _build_core_lookup(engine, kind)
-        insert2, update2, skip2 = _partition_staging(engine, staging_df, core_lookup2, kind)
-        report.idempotent = len(insert2) == 0 and len(update2) == 0
+        insert2, _update2 = _partition_staging(engine, staging_df, core_lookup2, kind)
+        report.idempotent = len(insert2) == 0
         if not report.idempotent:
             report.errors.append(
-                f"Idempotency violation: second pass would insert {len(insert2)}, "
-                f"update {len(update2)}"
+                f"Idempotency violation: second pass would insert {len(insert2)}"
             )
         log.info("Idempotency check done, time %.3fs", time.perf_counter() - t)
 
@@ -317,28 +398,213 @@ def _load(kind: _CoreKind) -> LoadReport:
 
 
 # ------------------------------------------------------------------ #
+#  Geography rebuild after a Boundary release (issue #5)               #
+# ------------------------------------------------------------------ #
+
+
+@dataclass(frozen=True)
+class GeographyRebuild:
+    rows_updated: int
+    collisions: int
+    errors: tuple[str, ...]
+
+
+def rebuild_core_geography(
+    engine: Engine, kind: _CoreKind, boundaries
+) -> GeographyRebuild:
+    """Rederive state, region and district for every Core unit of a kind.
+
+    Every Core row is rebuilt from its own geometry, so units retained from
+    earlier snapshots are re-enriched too, not just those still in staging.
+    Outside-location and onshore-in-sea collisions depend on the state, so the
+    kind's collision annotation is then refreshed from scratch.
+    """
+    units = gpd.read_postgis(
+        f"SELECT unit_id, geometry FROM {CORE_SCHEMA}.{kind.core_table}",
+        engine,
+        geom_col="geometry",
+    )
+    geography = enrich_geography(units, boundaries)
+    records = [
+        (int(unit_id), state, region, district)
+        for unit_id, state, region, district in zip(
+            units["unit_id"],
+            geography["state"],
+            geography["region"],
+            geography["district"],
+        )
+    ]
+    with engine.begin() as conn:
+        if records:
+            execute_values(
+                conn.connection.cursor(),
+                f"UPDATE {CORE_SCHEMA}.{kind.core_table} c "
+                "SET state = v.state, region = v.region, district = v.district "
+                "FROM (VALUES %s) AS v(unit_id, state, region, district) "
+                "WHERE c.unit_id = v.unit_id",
+                records,
+                template="(%s::bigint, %s::text, %s::text, %s::text)",
+                page_size=2000,
+            )
+
+    _reset_collision_annotation(engine, affected_ids=None, kind=kind)
+    collision_df, close_units = _detect_collisions(engine, kind=kind, affected_ids=None)
+    _write_collision_links(engine, collision_df, close_units, kind=kind)
+
+    with engine.connect() as conn:
+        stored = {
+            int(unit_id): (state, region, district)
+            for unit_id, state, region, district in conn.execute(
+                text(
+                    f"SELECT unit_id, state, region, district "
+                    f"FROM {CORE_SCHEMA}.{kind.core_table}"
+                )
+            )
+        }
+    mismatched = [
+        unit_id for unit_id, *geo in records if stored.get(unit_id) != tuple(geo)
+    ]
+    errors = (
+        (f"Core geography of {kind.core_table} not rebuilt for {len(mismatched)} units",)
+        if mismatched
+        else ()
+    )
+    return GeographyRebuild(len(records), len(collision_df), errors)
+
+
+# ------------------------------------------------------------------ #
 #  Staging read                                                        #
 # ------------------------------------------------------------------ #
 
 
-def _read_staging(engine: Engine, kind: _CoreKind) -> pandas.DataFrame:
+def _read_staging(
+    engine: Engine, kind: _CoreKind, sources: tuple[str, ...] | None = None
+) -> pandas.DataFrame:
     """Read all good (bad_quality=false) rows from the kind's staging tables."""
+    chosen = kind.staging_sources if sources is None else sources
     union_parts = [
         f"SELECT * FROM {STAGING_SCHEMA}.{source} WHERE NOT bad_quality"
-        for source in kind.staging_sources
+        for source in chosen
     ]
     sql = " UNION ALL ".join(union_parts)
     return pandas.read_sql(text(sql), engine)
 
 
-def _bad_quality_count(engine: Engine, kind: _CoreKind) -> int:
+def _bad_quality_count(
+    engine: Engine, kind: _CoreKind, sources: tuple[str, ...] | None = None
+) -> int:
     """Count all bad_quality rows across the kind's staging tables."""
+    chosen = kind.staging_sources if sources is None else sources
     sums = " + ".join(
         f"(SELECT COUNT(*) FROM {STAGING_SCHEMA}.{s} WHERE bad_quality)"
-        for s in kind.staging_sources
+        for s in chosen
     )
     with engine.connect() as conn:
         return int(conn.execute(text(f"SELECT {sums}")).scalar())
+
+
+def _verify_authoritative_source(
+    engine: Engine,
+    kind: _CoreKind,
+    *,
+    source: str,
+    ingestion_run_id,
+    known_before: frozenset[str],
+) -> list[str]:
+    """Check that Core now reflects every good row of the snapshot.
+
+    Membership must match staging; every good unit must be in Core with its
+    source, Reference ID and the kind's ``verified_columns`` equal to the
+    staging values; and no bad-quality unit may have *created* a Core row.
+    """
+    errors, _ = _verify_membership_matches_staging(
+        engine, source=source, ingestion_run_id=ingestion_run_id
+    )
+    columns = kind.verified_columns
+    staging_select = ", ".join(("unit_id", "bad_quality", "reference_id", *columns))
+    with engine.connect() as connection:
+        staging = connection.execute(
+            text(f"SELECT {staging_select} FROM {STAGING_SCHEMA}.{source}")
+        ).mappings().all()
+    staging_by_key = {str(row["unit_id"]): row for row in staging}
+
+    core_lookup, _ = _build_core_lookup(engine, kind)
+    good_units = {
+        unit_key: row
+        for unit_key, row in staging_by_key.items()
+        if not row["bad_quality"]
+    }
+    missing = sorted(set(good_units) - set(core_lookup))
+    if missing:
+        errors.append(f"Good snapshot units missing from Core: {len(missing)}")
+    # A bad-quality member must not have *created* a Core row. Finding one that
+    # was already there is correct history, not an error: a unit can turn
+    # bad-quality in a later snapshot and its retained Core row survives.
+    introduced_bad = sorted(
+        (set(staging_by_key) - set(good_units)) & set(core_lookup) - known_before
+    )
+    if introduced_bad:
+        errors.append(
+            f"Bad-quality snapshot units created Core rows: {len(introduced_bad)}"
+        )
+
+    core_ids = [
+        core_lookup[unit_key] for unit_key in good_units if unit_key in core_lookup
+    ]
+    if not core_ids:
+        return errors
+    core_select = ", ".join(
+        ("unit_id", "energy_source", "reference_id")
+        + tuple(kind.column_map[column] for column in columns)
+    )
+    with engine.connect() as connection:
+        core_rows = {
+            int(row["unit_id"]): row
+            for row in connection.execute(
+                text(
+                    f"SELECT {core_select} FROM {CORE_SCHEMA}.{kind.core_table} "
+                    "WHERE unit_id = ANY(:ids)"
+                ),
+                {"ids": core_ids},
+            ).mappings()
+        }
+    for unit_key, staged in good_units.items():
+        core_row = core_rows.get(core_lookup.get(unit_key))
+        if core_row is None:
+            continue
+        if core_row["energy_source"] != source:
+            errors.append(f"Core source mismatch for {unit_key}")
+            break
+        if core_row["reference_id"] != staged["reference_id"]:
+            errors.append(f"Core Reference ID mismatch for {unit_key}")
+            break
+        mismatched = next(
+            (
+                column
+                for column in columns
+                if not _same_value(staged[column], core_row[kind.column_map[column]])
+            ),
+            None,
+        )
+        if mismatched is not None:
+            errors.append(f"Core {mismatched} mismatch for {unit_key}")
+            break
+    return errors
+
+
+def _same_value(staged, core) -> bool:
+    """Compare a scalar staging value with its Core copy; nulls compare equal.
+
+    Only for the scalar ``verified_columns`` (float, timestamp, text); JSON or
+    list values would make ``pandas.isna`` return an array.
+    """
+    if pandas.isna(staged) or pandas.isna(core):
+        return pandas.isna(staged) and pandas.isna(core)
+    if isinstance(staged, (int, float)) or isinstance(core, (int, float)):
+        return float(staged) == float(core)
+    if hasattr(staged, "year") or hasattr(core, "year"):
+        return pandas.Timestamp(staged) == pandas.Timestamp(core)
+    return staged == core
 
 
 # ------------------------------------------------------------------ #
@@ -349,39 +615,49 @@ def _bad_quality_count(engine: Engine, kind: _CoreKind) -> int:
 def _build_core_lookup(
     engine: Engine, kind: _CoreKind
 ) -> tuple[dict[str, int], int]:
-    """Build a lookup dict mapping record identity → core unit_id.
-
-    For rows with reference_id: key = reference_id.
-    For rows without reference_id (synthetic): key = synthetic hash
-    derived from the same attributes as the staging hash.
-    Returns (lookup, existing_count).
-    """
     lookup: dict[str, int] = {}
-    with engine.connect() as conn:
-        rows = conn.execute(
+    with engine.connect() as connection:
+        rows = connection.execute(
             text(
-                f"SELECT unit_id, reference_id, energy_source, "
-                f"longitude, latitude, installed_capacity, commissioning_date "
+                f"SELECT unit_id, reference_id, energy_source, longitude, "
+                f"latitude, geo_accuracy "
                 f"FROM {CORE_SCHEMA}.{kind.core_table}"
             )
         ).fetchall()
-    for row in rows:
-        unit_id, reference_id, energy_source, lon, lat, cap, comm_date = row
+        synthetic_ids = [row[0] for row in rows if row[1] is None]
+        locations: dict[int, object] = {}
+        if synthetic_ids:
+            location_rows = connection.execute(
+                text(
+                    f"SELECT up.unit_id, p.value "
+                    f"FROM {CORE_SCHEMA}.{kind.units_properties_table} up "
+                    f"JOIN {CORE_SCHEMA}.{kind.properties_table} p "
+                    "ON p.prop_id = up.prop_id "
+                    "WHERE p.name = 'location' AND up.unit_id = ANY(:ids)"
+                ),
+                {"ids": synthetic_ids},
+            ).fetchall()
+            locations = {int(unit_id): value for unit_id, value in location_rows}
+
+    for unit_id, reference_id, energy_source, longitude, latitude, geo_accuracy in rows:
         if reference_id is not None:
-            lookup[reference_id] = unit_id
+            identity = f"{energy_source}_{reference_id}"
         else:
-            h = _synthetic_hash(energy_source, lon, lat, cap, comm_date)
-            lookup[h] = unit_id
+            if unit_id not in locations:
+                raise RuntimeError(
+                    f"core.{kind.core_table} unit {unit_id} has no Reference ID "
+                    "and no location property, so its synthetic identity is "
+                    "not reconstructable"
+                )
+            identity = synthetic_identity(
+                source=energy_source,
+                location=locations[unit_id],
+                x=longitude,
+                y=latitude,
+                geo_accuracy=geo_accuracy,
+            )
+        lookup[identity] = unit_id
     return lookup, len(rows)
-
-
-def _synthetic_hash(source: str, x, y, capacity, commissioning) -> str:
-    """Recompute the synthetic hash from stored core values (ADR 0001).
-
-    The inputs mirror the staging derivation so the hash is stable.
-    """
-    payload = "|".join(str(v) for v in (source, x, y, capacity, commissioning))
-    return SYNTHETIC_ID_PREFIX + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 # ------------------------------------------------------------------ #
@@ -390,27 +666,7 @@ def _synthetic_hash(source: str, x, y, capacity, commissioning) -> str:
 
 
 def _staging_identities(df: pandas.DataFrame) -> pandas.Series:
-    """Record identity for every staging row: reference_id or synthetic hash."""
-    ref_id = df["reference_id"]
-    has_ref = ref_id.notna() & (ref_id.astype(str) != "nan")
-    identity = pandas.Series(index=df.index, dtype="object")
-    if has_ref.any():
-        identity[has_ref] = ref_id[has_ref].astype(str)
-
-    synthetic = ~has_ref
-    if synthetic.any():
-        payload = (
-            df["energy_source"].map(str)
-            + "|" + df["x_coordinates"].map(str)
-            + "|" + df["y_coordinates"].map(str)
-            + "|" + df["installed_capacity"].map(str)
-            + "|" + df["commissioning_date"].map(str)
-        )
-        identity[synthetic] = payload[synthetic].map(
-            lambda p: SYNTHETIC_ID_PREFIX
-            + hashlib.sha256(p.encode()).hexdigest()[:16]
-        )
-    return identity
+    return df["unit_id"].astype("string")
 
 
 def _partition_staging(
@@ -418,59 +674,29 @@ def _partition_staging(
     staging_df: pandas.DataFrame,
     core_lookup: dict[str, int],
     kind: _CoreKind,
-) -> tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]:
-    """Split staging rows into insert, update, and skip buckets.
+) -> tuple[pandas.DataFrame, pandas.DataFrame]:
+    """Split staging rows into insert and authoritative update buckets.
 
-    A row goes to UPDATE when a core match exists and the staging reference_date
-    is strictly fresher than the core row's.  A row goes to SKIP when the core
-    match exists but the staging date is not fresher.  A row goes to INSERT
-    when no core match exists.
+    A complete Source snapshot is authoritative for every row it contains, so
+    a matched row is always updated regardless of reference_date. Only a row
+    with no Core match is inserted. Rows absent from the snapshot are never
+    touched, which keeps historical Core units.
     """
     if staging_df.empty:
-        return staging_df.copy(), staging_df.copy(), staging_df.copy()
+        return staging_df.copy(), staging_df.copy()
 
     staging_df = staging_df.copy()
     staging_df["_identity"] = _staging_identities(staging_df)
-
-    core_ref_dates: dict[int, object] = {}
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                f"SELECT unit_id, reference_date FROM {CORE_SCHEMA}.{kind.core_table}"
-            )
-        ).fetchall()
-    for unit_id, ref_date in rows:
-        core_ref_dates[unit_id] = ref_date
-
     matched = staging_df["_identity"].map(core_lookup)
     is_insert = matched.isna()
-    is_update = pandas.Series(False, index=staging_df.index)
-    is_skip = pandas.Series(False, index=staging_df.index)
-
-    non_insert_idx = staging_df.index[~is_insert].to_numpy()
-    if len(non_insert_idx):
-        matched_uids = matched[~is_insert].astype("int64")
-        core_dates = pandas.to_datetime(
-            matched_uids.map(core_ref_dates), errors="coerce"
-        )
-        staging_dates = pandas.to_datetime(
-            staging_df.loc[non_insert_idx, "reference_date"], errors="coerce"
-        )
-        staging_missing = staging_dates.isna()
-        update_mask = (~staging_missing) & (
-            core_dates.isna() | (staging_dates > core_dates)
-        )
-        is_update[non_insert_idx] = update_mask.to_numpy()
-        is_skip[non_insert_idx] = (~update_mask).to_numpy()
+    is_update = ~is_insert
 
     update_df = staging_df[is_update].copy()
     if not update_df.empty:
         update_df["_core_unit_id"] = (
             update_df["_identity"].map(core_lookup).astype("int64")
         )
-    insert_df = staging_df[is_insert].copy()
-    skip_df = staging_df[is_skip].copy()
-    return insert_df, update_df, skip_df
+    return staging_df[is_insert].copy(), update_df
 
 
 # ------------------------------------------------------------------ #
@@ -479,13 +705,21 @@ def _partition_staging(
 
 
 def _apply_upsert(
-    engine: Engine, insert_df: pandas.DataFrame, update_df: pandas.DataFrame, kind: _CoreKind
-) -> None:
+    engine: Engine,
+    insert_df: pandas.DataFrame,
+    update_df: pandas.DataFrame,
+    kind: _CoreKind,
+) -> dict[str, int]:
     """Insert new rows and update existing rows in the core table."""
+    mapping: dict[str, int] = {}
     with engine.begin() as conn:
-        _insert_core_rows(conn, insert_df, kind)
+        inserted_ids = _insert_core_rows(conn, insert_df, kind)
+        for unit_id, core_unit_id in zip(insert_df["unit_id"], inserted_ids):
+            mapping[str(unit_id)] = core_unit_id
         for _, row in update_df.iterrows():
             _update_core_row(conn, row, kind)
+            mapping[str(row["unit_id"])] = int(row["_core_unit_id"])
+    return mapping
 
 
 def _max_unit_id(engine: Engine, kind: _CoreKind) -> int:
@@ -533,20 +767,27 @@ def _core_row_values(row: pandas.Series, column_map: dict[str, str]) -> dict:
     }
 
 
-def _insert_core_rows(conn, df: pandas.DataFrame, kind: _CoreKind) -> None:
+def _insert_core_rows(
+    conn,
+    df: pandas.DataFrame,
+    kind: _CoreKind,
+) -> list[int]:
     """Bulk-insert staging rows into the core table via execute_values."""
     if df.empty:
-        return
+        return []
     sub = df[list(kind.column_map)].rename(columns=kind.column_map)
     sub = sub.astype("object").where(pandas.notna(sub), None)
     cols = ", ".join(sub.columns)
     records = [tuple(r[k] for k in sub.columns) for r in sub.to_dict("records")]
-    execute_values(
+    returned = execute_values(
         conn.connection.cursor(),
-        f"INSERT INTO {CORE_SCHEMA}.{kind.core_table} ({cols}) VALUES %s",
+        f"INSERT INTO {CORE_SCHEMA}.{kind.core_table} ({cols}) "
+        "VALUES %s RETURNING unit_id",
         records,
         page_size=1000,
+        fetch=True,
     )
+    return [int(row[0]) for row in returned]
 
 
 def _update_core_row(conn, row: pandas.Series, kind: _CoreKind) -> None:
@@ -1056,41 +1297,11 @@ def _reset_collision_annotation(
 # ------------------------------------------------------------------ #
 
 
-def _staging_to_core_unit_map(engine: Engine, kind: _CoreKind) -> dict[str, int]:
-    """Map each staging unit_id to its core unit_id.
-
-    Staging unit_ids are '<source>_<reference_id>' for referenced rows and
-    'syn_<hash>' for synthetic rows.  The core identity lookup keys on the
-    bare reference_id and the synthetic hash, so the map is built by
-    re-deriving the identity from each staging row.  bad_quality rows (never
-    loaded into core) are skipped by the lookup miss.
-    """
-    core_lookup, _ = _build_core_lookup(engine, kind)
-    mapping: dict[str, int] = {}
-    with engine.connect() as conn:
-        for source in kind.staging_sources:
-            rows = conn.execute(
-                text(
-                    f"SELECT unit_id, reference_id, energy_source, "
-                    f"x_coordinates, y_coordinates, installed_capacity, "
-                    f"commissioning_date FROM {STAGING_SCHEMA}.{source}"
-                )
-            ).fetchall()
-            for unit_id, reference_id, source_name, x, y, cap, comm in rows:
-                if reference_id is not None:
-                    identity = str(reference_id)
-                else:
-                    identity = _synthetic_hash(source_name, x, y, cap, comm)
-                core_uid = core_lookup.get(identity)
-                if core_uid is not None:
-                    mapping[str(unit_id)] = core_uid
-    return mapping
-
-
 def _transfer_properties(
     engine: Engine,
     staging_to_core: dict[str, int],
     kind: _CoreKind,
+    sources: Sequence[str],
     affected_ids: list[int] | None = None,
 ) -> tuple[int, int]:
     """Move the staging whitelist decomposition into core for affected units.
@@ -1105,6 +1316,12 @@ def _transfer_properties(
       first so an in-place update reflects the new record (ADR 0001), while
       collision/close_to links and skipped units are left untouched.
 
+    *sources* is the whole set of the kind's staging sources this load read,
+    because a snapshot load upserts the complete kind: the delete below spans
+    every affected unit of the kind, so the read that refills them has to span
+    the kind too, or the other sources would lose their decomposed properties
+    (``location`` among them, which synthetic identity needs to be rebuilt).
+
     Returns (properties, links) counts written in this transfer.
     """
     if affected_ids is not None and not affected_ids:
@@ -1114,12 +1331,12 @@ def _transfer_properties(
 
     wanted_units: dict[int, list[tuple[str, str]]] = defaultdict(list)
     with engine.connect() as conn:
-        for source in kind.staging_sources:
+        for staging_source in sources:
             rows = conn.execute(
                 text(
                     f"SELECT up.unit_id, p.name, p.value "
-                    f"FROM {STAGING_SCHEMA}.{source}_units_properties up "
-                    f"JOIN {STAGING_SCHEMA}.{source}_properties p "
+                    f"FROM {STAGING_SCHEMA}.{staging_source}_units_properties up "
+                    f"JOIN {STAGING_SCHEMA}.{staging_source}_properties p "
                     f"ON p.param_id = up.param_id "
                     f"WHERE p.name <> '{BAD_QUALITY_PROPERTY}'"
                 )

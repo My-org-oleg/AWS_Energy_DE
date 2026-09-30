@@ -4,12 +4,23 @@ from pathlib import Path
 import click
 import time
 
-from etl.config import SOURCE_NAMES, boundaries_manifest, sources_data_dir
+from etl.config import SOURCE_NAMES, boundaries_manifest, get_engine, sources_data_dir
 from etl.extract import extract_boundaries, extract_source
+from etl.ingestion import (
+    Boto3S3Adapter,
+    Boto3SNSAdapter,
+    Boto3SQSAdapter,
+    BootstrapConfig,
+    PipelineProcessor,
+    bootstrap as bootstrap_ingestion,
+    redrive as redrive_versions,
+    run_startup,
+    run_worker,
+)
 from etl.load import load_generators, load_storages
 from etl.marts import build_marts
+from etl.source_data import SourceDataset, SourceValidationError, inspect_source_gpkg
 from etl.transform import transform_sources
-from etl.utils import _source_from_filename
 
 
 @click.group()
@@ -18,6 +29,155 @@ def cli(verbose: bool):
     """Energy DE ETL pipeline."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=level)
+
+
+def _client(service: str):
+    import boto3
+
+    return boto3.client(service)
+
+
+def _s3_adapter() -> Boto3S3Adapter:
+    return Boto3S3Adapter(_client("s3"))
+
+
+def _sqs_adapter(queue_url: str) -> Boto3SQSAdapter:
+    return Boto3SQSAdapter(_client("sqs"), queue_url)
+
+
+def _sns_adapter(topic_arn: str) -> Boto3SNSAdapter:
+    return Boto3SNSAdapter(_client("sns"), topic_arn)
+
+
+def _echo_check_report(title: str, result) -> None:
+    """The shared bootstrap report head: metadata, worker start, key checks."""
+    click.echo(f"\n{title}:")
+    click.echo(f"  Metadata ready   : {'yes' if result.metadata_ready else 'no'}")
+    click.echo(
+        f"  Worker start     : {'allowed' if result.worker_start_allowed else 'blocked'}"
+    )
+    for check in result.checks:
+        requirement = "required" if check.required else "optional"
+        click.echo(f"  {check.key} ({requirement}): {check.message}")
+
+
+@cli.command()
+@click.option("--bucket", envvar="S3_BUCKET", required=True, help="Versioned S3 data bucket.")
+def bootstrap(bucket: str):
+    result = bootstrap_ingestion(
+        BootstrapConfig(bucket=bucket),
+        engine=get_engine(),
+        s3=_s3_adapter(),
+    )
+    _echo_check_report("Bootstrap report", result)
+    if not result.worker_start_allowed:
+        raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--queue-url", envvar="SQS_QUEUE_URL", required=True, help="Queue carrying the S3 ObjectCreated events.")
+@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for ingestion and DLQ alerts.")
+@click.option("--max-messages", type=int, default=None, help="Stop after this many messages (default: run until stopped).")
+def worker(queue_url: str, topic_arn: str, max_messages: int | None):
+    """Run the event-driven ingestion worker, one SQS message at a time.
+
+    Each message is an ordered work unit: its Boundary records are applied as
+    one release before its Source records, every record is processed
+    independently, and the message is acknowledged only when all of them are
+    successful or terminally skipped — anything retryable stays for SQS
+    redelivery. The three marts are refreshed once per message. Run
+    `python -m etl bootstrap` first: the worker expects the Boundary levels to
+    be in place.
+    """
+    click.echo(f"\nIngestion worker reading {queue_url}")
+    engine = get_engine()
+    s3 = _s3_adapter()
+    try:
+        processed = run_worker(
+            engine=engine,
+            s3=s3,
+            sqs=_sqs_adapter(queue_url),
+            sns=_sns_adapter(topic_arn),
+            processor=PipelineProcessor(engine, s3=s3),
+            max_messages=max_messages,
+        )
+    except KeyboardInterrupt:
+        click.echo("Worker stopped.")
+        return
+    click.echo(f"Worker processed {processed} message(s).")
+
+
+@cli.command()
+@click.option("--bucket", envvar="S3_BUCKET", required=True, help="Versioned S3 data bucket.")
+@click.option("--queue-url", envvar="SQS_QUEUE_URL", required=True, help="Queue carrying the S3 ObjectCreated events.")
+@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for ingestion and DLQ alerts.")
+def startup(bucket: str, queue_url: str, topic_arn: str):
+    """Bootstrap the server deployment, then run the ingestion worker.
+
+    The explicit startup path (issue #8): database preconditions and the fixed
+    S3 key checks, the current Boundary releases applied with their downstream
+    rebuild, and the current Source object versions enqueued — then the worker.
+    A fatal Boundary condition (a missing or invalid release) refuses the
+    worker start, so the container crash-loops until the operator fixes it.
+    """
+    engine = get_engine()
+    s3 = _s3_adapter()
+    processor = PipelineProcessor(engine, s3=s3)
+    result = run_startup(
+        BootstrapConfig(bucket=bucket),
+        engine=engine,
+        s3=s3,
+        sqs=_sqs_adapter(queue_url),
+        processor=processor,
+    )
+
+    _echo_check_report("Startup report", result)
+    if result.release_results:
+        applied = sorted(
+            {
+                str(detail)
+                for stage in result.release_results
+                for name, detail in stage.details.items()
+                if name == "level"
+            }
+        )
+        click.echo(f"  Boundary release : applied (levels {', '.join(applied)})")
+    else:
+        click.echo("  Boundary release : already current")
+    click.echo(f"  Enqueued         : {len(result.enqueued)} source object version(s)")
+    for object_id in result.enqueued:
+        click.echo(f"    {object_id.key} ({object_id.version_id})")
+    click.echo(f"  Already known    : {len(result.known)} source object version(s)")
+
+    if not result.worker_start_allowed:
+        raise SystemExit(1)
+
+    click.echo(f"\nIngestion worker reading {queue_url}")
+    run_worker(
+        engine=engine,
+        s3=s3,
+        sqs=_sqs_adapter(queue_url),
+        sns=_sns_adapter(topic_arn),
+        processor=processor,
+    )
+
+
+@cli.command()
+@click.option("--queue-url", envvar="SQS_QUEUE_URL", required=True, help="Queue the S3 ObjectCreated events are redriven to.")
+@click.option("--key", default=None, help="Redrive only this object key (default: every failed or DLQ object version).")
+def redrive(queue_url: str, key: str | None):
+    """Re-enqueue failed or DLQ object versions for another attempt.
+
+    The explicit recovery path (issue #8): every object version the worker left
+    unsettled — a retryable failure, or a message the queue moved to the DLQ —
+    is sent back to the queue, which resumes its run on the next delivery.
+    Settled versions (succeeded, stale, terminal) are left alone.
+    """
+    redriven = redrive_versions(get_engine(), sqs=_sqs_adapter(queue_url), key=key)
+
+    click.echo(f"\nRedriven {len(redriven)} object version(s):")
+    for object_id in redriven:
+        click.echo(f"  {object_id.key} ({object_id.version_id})")
 
 
 @cli.command()
@@ -57,10 +217,11 @@ def extract(target: str | None, force: bool):
     """Extract unit sources found in a folder into versioned raw tables.
 
     TARGET is the sources folder (defaults to the configured sources folder).
-    Each *_V<YYYYMMDD>.gpkg matching one of the six unit sources is extracted
-    in SOURCE_NAMES order; look-alikes such as Solar_Energy_Polygons and
-    Cogeneration_Units, and any other files, are logged and skipped. Files
-    already logged in loaded_files are skipped unless --force is given.
+    Each *.gpkg whose single layer is a valid unit-source snapshot is extracted
+    in SOURCE_NAMES order, so discovery follows the file content rather than its
+    name. Look-alikes such as Solar_Energy_Polygons and Cogeneration_Units fail
+    snapshot validation and are logged and skipped. Files already logged in
+    loaded_files are skipped unless --force is given.
     """
     log = logging.getLogger(__name__)
 
@@ -72,30 +233,35 @@ def extract(target: str | None, force: bool):
         raise click.BadParameter(f"Sources folder not found: {data_dir}")
 
     log.info("Extracting energy sources from %s", data_dir.name)
-    by_source: dict[str, Path] = {}
+    by_source: dict[str, tuple[Path, SourceDataset]] = {}
     skipped: list[str] = []
     for f in sorted(data_dir.glob("*.gpkg")):
-        source = _source_from_filename(f.name)
-        if not source:
+        try:
+            dataset = inspect_source_gpkg(f)
+        except SourceValidationError as error:
+            log.info("Skipping %s: %s", f.name, error)
             skipped.append(f.name)
             continue
-        if source in by_source:
+        if dataset.source in by_source:
             log.warning(
                 "Multiple files map to source %s: keeping %s, ignoring %s",
-                source, by_source[source].name, f.name,
+                dataset.source, by_source[dataset.source][0].name, f.name,
             )
             continue
-        by_source[source] = f
+        by_source[dataset.source] = (f, dataset)
     if skipped:
         log.info("Skipping unrecognised file(s): %s", ", ".join(skipped))
 
-    filenames = [by_source[s] for s in SOURCE_NAMES if s in by_source]
-    log.info("Extracting %d source file(s) from %s", len(filenames), data_dir)
+    chosen = [by_source[s] for s in SOURCE_NAMES if s in by_source]
+    log.info("Extracting %d source file(s) from %s", len(chosen), data_dir)
 
-    reports = [extract_source(f, force=force) for f in filenames]
+    reports = [
+        extract_source(path, force=force, dataset=dataset)
+        for path, dataset in chosen
+    ]
 
     for r in reports:
-        click.echo(f"\nExtraction report ({r.source}):")
+        click.echo(f"\nExtraction report ({r.source or r.origin}):")
         click.echo(r.summary())
     click.echo(f"\nExtraction complete. Total time: {(time.perf_counter() - start):.2f} seconds.")
 
@@ -146,8 +312,9 @@ def load():
 
     Reads the good staging rows from all six sources and upserts generators
     into core.generators and storages into core.storages, each with a serial
-    surrogate key, collision checks, and property-link annotation.  The load
-    is incremental and idempotent.
+    surrogate key, collision checks, and property-link annotation.  The
+    staging tables are authoritative for the rows they carry, so the load is
+    repeatable and never deletes a core unit.
     """
     click.echo("\nRunning load stage for generators and storages...")
     start = time.perf_counter()

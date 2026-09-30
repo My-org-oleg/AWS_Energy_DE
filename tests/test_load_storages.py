@@ -13,9 +13,12 @@ from sqlalchemy import create_engine, text
 
 from etl.config import (
     BAD_QUALITY_PROPERTY,
+    COLLISION_PROPERTY,
     CORE_SCHEMA,
     DECOMPOSED_PROPERTIES,
+    SEA_REGIONS,
     STAGING_SCHEMA,
+    STORAGE_CAPACITY_COLLISION_REASON,
 )
 from etl.load import load_storages
 
@@ -217,16 +220,17 @@ class TestIdempotency:
         count_after_second = _scalar(f"SELECT COUNT(*) FROM {CORE_SCHEMA}.storages")
         assert count_after_second == count_after_first
         assert r2.rows_inserted == 0
-        assert r2.rows_skipped == count_after_first
+        assert r2.rows_updated == count_after_first
+        assert r2.rows_retained == 0
         assert r1.idempotent and r2.idempotent
 
 
 # ------------------------------------------------------------------ #
-#  Incremental update — freshness gate                                  #
+#  Snapshot authority — present rows always update, absent rows stay      #
 # ------------------------------------------------------------------ #
 
 
-class TestIncrementalUpdate:
+class TestSnapshotAuthority:
     def test_fresher_row_updates_in_place(self):
         load_storages()
         # Pick an existing unit with a reference_id
@@ -281,7 +285,7 @@ class TestIncrementalUpdate:
                 {"old_date": old_ref_date, "ref_id": reference_id},
             )
 
-    def test_staler_row_skipped(self):
+    def test_present_row_updates_even_with_older_date(self):
         load_storages()
         with ENGINE.connect() as conn:
             row = conn.execute(
@@ -321,8 +325,9 @@ class TestIncrementalUpdate:
             ).fetchone()
         assert row is not None
         assert row[0] == core_unit_id
-        # Should NOT be updated to the stale date
-        assert row[1] > stale_date
+        # A complete Source snapshot is authoritative for the rows it carries,
+        # so an older Reference Date does not shield the Core row from update.
+        assert row[1] == stale_date
 
         # Restore staging
         with ENGINE.begin() as conn:
@@ -365,8 +370,24 @@ class TestCollisions:
         )
         assert bad_capacity == staging_bad_capacity
 
+    def test_storage_capacity_rule_actually_fires(self, _loaded_core):
+        """Absolute count, unlike the reconciliation above.
+
+        `test_storage_capacity_collision_flagged` compares core against staging,
+        so it passes just as happily when no storage trips the rule at all. The
+        fixture deliberately carries one unit with storage_capacity 0 and a
+        positive installed capacity, so pin that it is still there.
+        """
+        # The property dimension is UNIQUE on (name, value), so this counts the
+        # distinct reason string, not the units carrying it.
+        assert _scalar(
+            f"SELECT COUNT(*) FROM {CORE_SCHEMA}.storage_properties "
+            f"WHERE name = '{COLLISION_PROPERTY}' "
+            f"AND value LIKE '%{STORAGE_CAPACITY_COLLISION_REASON}%'"
+        ) == 1
+
     def test_onshore_in_sea_flagged(self, _loaded_core):
-        sea_states = "'North Sea', 'Baltic Sea', 'Kattegat'"
+        sea_states = ", ".join(f"'{region}'" for region in SEA_REGIONS)
         onshore_sea = _scalar(
             f"SELECT COUNT(*) FROM {CORE_SCHEMA}.storages "
             f"WHERE state IN ({sea_states}) AND collision"

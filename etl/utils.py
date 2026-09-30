@@ -4,34 +4,10 @@ import re
 from datetime import date
 from pathlib import Path
 
-import pandas
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from etl.config import SOURCE_NAMES
 from etl.config import BOUNDARY_SIMPLIFY_TOLERANCE, RAW_SCHEMA, SERVICE_SCHEMA
-
-# Filename stem per canonical source key (ordered as SOURCE_NAMES). The ETL
-# discovers unit sources by filename, so the two rigs that look like real
-# sources but are not loadable — Solar_Energy_Polygons and Cogeneration_Units —
-# simply do not match the anchored pattern below.
-FILENAMES_BY_SOURCE = {
-    "bio": "Bioenergy",
-    "gas": "Gas_Producer",
-    "hydro": "Hydropower",
-    "solar": "Solar_Energy",
-    "wind": "Wind_Energy",
-    "storage": "Energy_Storage",
-}
-
-_FILENAME_BY_UPPER_PREFIX = {
-    prefix.upper(): source for source, prefix in FILENAMES_BY_SOURCE.items()
-}
-
-FILENAME_PATTERN = re.compile(
-    r"^(" + "|".join(FILENAMES_BY_SOURCE.values()) + r")_V\d{8}\.gpkg$",
-    re.IGNORECASE,
-)
 
 
 def _raw_table_versions(engine: Engine, source: str) -> list[tuple[str, int, str]]:
@@ -75,19 +51,21 @@ def _latest_table_version(engine: Engine, source: str) -> str | None:
     return versions[-1][2] if versions else None
 
 
-def _is_logged(engine: Engine, signature: tuple[str, int, float]) -> bool:
-    """True if the (filename, filesize, modified_at) load signature is logged."""
+def _loaded_table_for_signature(
+    engine: Engine, signature: tuple[str, int, float]
+) -> str | None:
+    """Return the raw table logged for a load signature, or None if unseen."""
     filename, filesize, modified_at = signature
     with engine.connect() as conn:
         row = conn.execute(
             text(
-                f"SELECT 1 FROM {SERVICE_SCHEMA}.loaded_files "
+                f"SELECT loaded_to FROM {SERVICE_SCHEMA}.loaded_files "
                 "WHERE filename = :filename AND filesize = :filesize "
                 "AND modified_at = to_timestamp(:modified_at) LIMIT 1"
             ),
             {"filename": filename, "filesize": filesize, "modified_at": modified_at},
         ).first()
-        return row is not None
+    return str(row[0]) if row else None
 
 
 def _log_load(
@@ -109,35 +87,6 @@ def _log_load(
             },
         )
         conn.commit()
-
-
-def _drop_duplicate_reference_ids(df: pandas.DataFrame) -> int:
-    """Drop rows whose non-null reference_id appears earlier in the file.
-
-    Rows without a reference_id are never treated as duplicates: the solar
-    file carries 39 such rows (Fraunhofer-sourced) that must all be retained.
-    Returns the number of rows dropped.
-    """
-    before = len(df)
-    dup_mask = df["reference_id"].duplicated(keep="first") & df["reference_id"].notna()
-    df.drop(df.index[dup_mask], inplace=True)
-    return before - len(df)
-
-
-def _source_from_filename(filename: str) -> str:
-    """Map a source file name to its canonical source key via an anchored regex.
-
-    Only the six known `_V<YYYYMMDD>.gpkg` source files match (case-
-    insensitive): 'Bioenergy_V20260203.gpkg' maps to 'bio',
-    'Energy_Storage_V20260203.gpkg' to 'storage', and so on. Look-alikes such
-    as 'Solar_Energy_Polygons_V20260203.gpkg' and 'Cogeneration_Units_...'
-    fail the anchored suffix match, so a folder glob cannot load them.
-    Returns an empty string when the file name cannot be mapped.
-    """
-    match = FILENAME_PATTERN.match(filename)
-    if not match:
-        return ""
-    return _FILENAME_BY_UPPER_PREFIX[match.group(1).upper()]
 
 
 def _read_manifest(manifest: Path) -> list[str]:

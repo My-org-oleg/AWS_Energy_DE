@@ -1,10 +1,11 @@
 """Integration tests for the spec v2.2 transform contract (issue #11).
 
-Run against the live dev PostGIS (`DATABASE_URL`), since the staging stage
-reads from raw versioned tables and writes via PostGIS.  All sources are
-transformed once per module by a shared fixture (the transform is idempotent
-— it drops and re-creates the staging tables) and the tests assert against
-that shared staging state.
+These run against the hermetic test database that `conftest.py` points the
+session at (`TEST_DATABASE_URL`), not against dev: the staging stage reads from
+raw versioned tables and writes via PostGIS. All sources are transformed once
+per session by a shared fixture (the transform is idempotent — it drops and
+re-creates the staging tables) and the tests assert against that shared staging
+state.
 """
 
 import os
@@ -20,6 +21,10 @@ SOURCE_NAMES = ("bio", "gas", "hydro", "solar", "wind", "storage")
 
 WHITELIST = set(DECOMPOSED_PROPERTIES)
 
+# Note the bio property set has no `note` even though the bio fixture carries
+# the column, exactly as the real file does: it is null on every row, and the
+# transform drops all-null values before the property dimension is built. The
+# column is in the fixture for shape fidelity, not to produce a property.
 EXPECTED_PROPERTIES = {
     "bio": {"biomass_type", "fuel_type", "reference_source", "technology"},
     "gas": {"reference_source", "technology"},
@@ -52,8 +57,14 @@ EXPECTED_JSON_KEYS = {
     "storage": set(),
 }
 
-EXPECTED_STATE_NULLS = {"hydro": 15, "solar": 5, "wind": 1, "storage": 30}
-EXPECTED_BAD_QUALITY = {"bio": 0, "gas": 0, "hydro": 0, "solar": 12, "wind": 0, "storage": 0}
+# Counts for the committed fixtures in tests/fixtures/sources (regenerate with
+# `python scripts/make_test_fixtures.py`). Each source with a state-null row
+# has exactly one — the point outside every state polygon — and solar carries
+# the two bad-quality rows (a null capacity, which is the only bad-capacity
+# reason the real solar file produces, and coordinates that disagree with the
+# geometry).
+EXPECTED_STATE_NULLS = {"hydro": 1, "solar": 1, "wind": 1, "storage": 1}
+EXPECTED_BAD_QUALITY = {"solar": 2}
 
 
 def scalar(sql: str) -> int:
@@ -122,7 +133,7 @@ def test_state_null_units_no_longer_bad_quality():
             f"SELECT COUNT(*) FROM stage.{source} WHERE state IS NULL AND bad_quality"
         )
         assert state_nulls == EXPECTED_STATE_NULLS.get(source, 0)
-        assert bad == EXPECTED_BAD_QUALITY[source]
+        assert bad == EXPECTED_BAD_QUALITY.get(source, 0)
         assert bad_state == 0
         assert (
             scalar(

@@ -6,7 +6,7 @@ on:
 
 jobs:
   publish-etl:
-    name: Publish pipeline image (khvostenko/energy-etl)
+    name: Publish pipeline image (khvostenko/aws-energy-etl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -14,12 +14,12 @@ jobs:
       - name: Publish to Docker Hub
         uses: elgohr/Publish-Docker-Github-Action@v5
         with:
-          name: khvostenko/energy-etl
+          name: khvostenko/aws-energy-etl
           username: khvostenko
           password: ${{ secrets.DOCKER_PASSWORD }}
 
   publish-viz:
-    name: Publish viz image (khvostenko/energy-viz)
+    name: Publish viz image (khvostenko/aws-energy-viz)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -27,7 +27,7 @@ jobs:
       - name: Publish to Docker Hub
         uses: elgohr/Publish-Docker-Github-Action@v5
         with:
-          name: khvostenko/energy-viz
+          name: khvostenko/aws-energy-viz
           dockerfile: Dockerfile.viz
           username: khvostenko
           password: ${{ secrets.DOCKER_PASSWORD }}

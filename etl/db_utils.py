@@ -12,8 +12,13 @@ from etl.config import (
 )
 
 
-def _table_exists(engine: Engine, table: str, schema: str = CORE_SCHEMA) -> bool:
-    """True if the named table exists in the given schema."""
+def _table_exists(engine: Engine, table: str, schema: str | None = None) -> bool:
+    """True if the named table exists in the given schema.
+
+    The default is resolved at call time rather than in the signature, so a
+    test that repoints CORE_SCHEMA is honoured by callers that omit `schema`.
+    """
+    schema = schema or CORE_SCHEMA
     with engine.connect() as conn:
         row = conn.execute(
             text(
@@ -25,30 +30,73 @@ def _table_exists(engine: Engine, table: str, schema: str = CORE_SCHEMA) -> bool
     return row is not None
 
 
-def _ensure_schema(engine: Engine, schema: str = RAW_SCHEMA) -> None:
-    """Create the given schema in the database if it does not exist."""
+def _ensure_schema(engine: Engine, schema: str | None = None) -> None:
+    """Create the given schema in the database if it does not exist.
+
+    The default is resolved at call time, as in `_table_exists`.
+    """
+    schema = schema or RAW_SCHEMA
     with engine.connect() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
         conn.commit()
 
 
-def _create_log_table(engine: Engine) -> None:
-    """Create the append-only loaded_files log if it does not exist."""
-    with engine.connect() as conn:
+def _create_log_table(engine: Engine, schema: str = SERVICE_SCHEMA) -> None:
+    """Create the loaded_files log and keep its current schema."""
+    with engine.begin() as conn:
         conn.execute(
             text(
                 f"""
-                CREATE TABLE IF NOT EXISTS {SERVICE_SCHEMA}.loaded_files (
-                    filename    TEXT,
-                    filesize    BIGINT,
-                    modified_at TIMESTAMPTZ,
-                    loaded_at   TIMESTAMPTZ,
-                    loaded_to   TEXT
+                CREATE TABLE IF NOT EXISTS {schema}.loaded_files (
+                    filename           TEXT,
+                    filesize           BIGINT,
+                    modified_at        TIMESTAMPTZ,
+                    loaded_at          TIMESTAMPTZ,
+                    loaded_to          TEXT,
+                    ingestion_run_id   UUID,
+                    bucket             TEXT,
+                    object_key         TEXT,
+                    object_version_id  TEXT,
+                    object_etag        TEXT,
+                    verified_at        TIMESTAMPTZ
                 )
                 """
             )
         )
-        conn.commit()
+        for column, definition in (
+            ("ingestion_run_id", "UUID"),
+            ("bucket", "TEXT"),
+            ("object_key", "TEXT"),
+            ("object_version_id", "TEXT"),
+            ("object_etag", "TEXT"),
+            ("verified_at", "TIMESTAMPTZ"),
+        ):
+            conn.execute(
+                text(
+                    f"ALTER TABLE {schema}.loaded_files "
+                    f"ADD COLUMN IF NOT EXISTS {column} {definition}"
+                )
+            )
+        conn.execute(
+            text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS uq_loaded_files_s3_identity "
+                f"ON {schema}.loaded_files "
+                "(bucket, object_key, object_version_id) "
+                f"WHERE bucket IS NOT NULL AND object_key IS NOT NULL "
+                "AND object_version_id IS NOT NULL"
+            )
+        )
+
+
+def _drop_staging_tables_in(conn, source: str) -> None:
+    for table in (f"{source}_units_properties", f"{source}_properties", source):
+        conn.execute(text(f"DROP TABLE IF EXISTS {STAGING_SCHEMA}.{table} CASCADE"))
+
+
+def _drop_staging_tables(engine: Engine, source: str) -> None:
+    """Drop the source's three staging tables, if they exist."""
+    with engine.begin() as conn:
+        _drop_staging_tables_in(conn, source)
 
 
 def _create_staging_tables(engine: Engine, source: str) -> None:
@@ -60,11 +108,7 @@ def _create_staging_tables(engine: Engine, source: str) -> None:
             f"{STORAGE_COLUMNS[1]}  DOUBLE PRECISION,\n"
         )
     with engine.begin() as conn:
-        conn.execute(
-            text(f"DROP TABLE IF EXISTS {STAGING_SCHEMA}.{source}_units_properties CASCADE")
-        )
-        conn.execute(text(f"DROP TABLE IF EXISTS {STAGING_SCHEMA}.{source}_properties CASCADE"))
-        conn.execute(text(f"DROP TABLE IF EXISTS {STAGING_SCHEMA}.{source} CASCADE"))
+        _drop_staging_tables_in(conn, source)
         conn.execute(
             text(
                 f"""

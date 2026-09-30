@@ -1,0 +1,13 @@
+# Terraform state and any operator-local variable files. The state holds the
+# account's resource ids and belongs in remote state, not in this repository.
+# `.terraform.lock.hcl` is deliberately *not* ignored: it pins the provider
+# version every platform resolves, so CI and an operator's laptop agree.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

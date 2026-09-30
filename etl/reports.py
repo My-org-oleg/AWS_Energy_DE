@@ -41,9 +41,9 @@ class ExtractionReport(ReportBase):
     """Result of one unit source extract: counts, version and verification outcome."""
 
     source: str = ""
+    origin: str = ""
     source_row_count: int = 0
     rows_loaded: int = 0
-    duplicates_dropped: int = 0
     attributes_empty: int = 0
     loaded_to: str | None = None
     skipped: bool = False
@@ -52,9 +52,9 @@ class ExtractionReport(ReportBase):
 
     def summary(self) -> str:
         lines = [
+            f"  Origin           : {self.origin or '-'}",
             f"  Source file rows : {self.source_row_count}",
             f"  Rows loaded      : {self.rows_loaded}",
-            f"  Duplicates dropped: {self.duplicates_dropped}",
             f"  Empty attributes  : {self.attributes_empty}",
             f"  Loaded to        : {self.loaded_to or '-'}",
             f"  Status           : {'SKIPPED (already loaded)' if self.skipped else ('PASS' if self.passed else 'FAIL')}",
@@ -110,7 +110,7 @@ class LoadReport(ReportBase):
     bad_rows_dropped: int = 0
     rows_inserted: int = 0
     rows_updated: int = 0
-    rows_skipped: int = 0
+    rows_retained: int = 0
     collisions: int = 0
     collision_links: int = 0
     links_count: int = 0
@@ -126,7 +126,7 @@ class LoadReport(ReportBase):
             f"  Bad rows dropped : {self.bad_rows_dropped}",
             f"  Rows inserted    : {self.rows_inserted}",
             f"  Rows updated     : {self.rows_updated}",
-            f"  Rows skipped     : {self.rows_skipped}",
+            f"  Rows retained    : {self.rows_retained}",
             f"  Collisions       : {self.collisions}",
             f"  Collision links  : {self.collision_links}",
             f"  Properties       : {self.properties_count}",

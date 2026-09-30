@@ -54,8 +54,9 @@ CORE_VIS_TABLES = ("generators", "storages")
 # the five loaded source labels instead.
 STORAGE_SOURCE = "storage"
 
-# The single active-units predicate (issue #24): commissioned on/after ``:from``
-# that is still running at ``:to`` (not decommissioned before ``:to``).  Used
+# The single active-units predicate (issue #9): commissioned inside the
+# selected interval — ``BETWEEN :from AND :to``, inclusive on both ends — that
+# is still running at ``:to`` (not decommissioned before ``:to``).  Used
 # verbatim by the unit fetch, so map and header always resolve the same set.
 ACTIVE_UNIT_PREDICATE = (
     "commissioning_date BETWEEN :from AND :to "
@@ -158,7 +159,7 @@ def units_query(
     projection; both are module constants, never user input.  One query covers
     every checked ``sources`` entry on the table via
     ``energy_source = ANY(:sources)`` (at most two tables total, render-opt),
-    under the issue #24 timescope predicate.
+    under the issue #9 timescope predicate.
 
     ``area_column`` (a `LEVEL_UNIT_AREA_COLUMN` constant) broadcasts the
     unit's area attribute as ``name`` — the join key to `service.boundaries`

@@ -1,1 +1,6 @@
 pytest>=8.0
+
+# Parses terraform/*.tf in tests/test_terraform_config.py. Pinned below 5.0:
+# 5.x returns a different shape for the same file, and the tests read the
+# configuration as data rather than as text.
+python-hcl2>=4.3,<5.0

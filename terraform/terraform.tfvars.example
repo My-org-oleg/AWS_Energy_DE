@@ -1,0 +1,30 @@
+# What the operator needs to finish the deployment (issue #10).
+#
+# Everything here is a reference the deployment cannot derive for itself; the
+# rest has a default. Copy to `terraform.tfvars` (git-ignored) and edit, or pass
+# with `-var` on the command line. No value is a secret — credentials come from
+# the operator's ambient AWS configuration and are never written to this repo.
+
+# The existing EC2 host that runs the Compose stack. The only required value:
+# nothing else in the stack knows which instance that is. Terraform creates the
+# instance profile for it; attaching the profile and restarting the instance is
+# the operator step in README.md.
+ec2_instance_id = "i-0123456789abcdef0"
+
+# Only set these to adopt resources that already exist, for example to keep a
+# bucket whose data is not ours to move. Left empty, names are derived from
+# name_prefix and the caller's account id.
+# bucket_name = "aws-energy-de-<account-id>-data"
+# queue_name  = "aws-energy-de-ingestion"
+# dlq_name    = "aws-energy-de-ingestion-dlq"
+# topic_name  = "aws-energy-de-alerts"
+
+# Notifications on the alert topic. An email subscription only starts receiving
+# after the confirmation click, which is the operator's action.
+# alert_subscriptions = {
+#   on_call_email = { protocol = "email", endpoint = "on-call@example.com" }
+# }
+
+# Extra targets every alarm notifies as well, for an on-call rotation that does
+# not live in this repository.
+# additional_alarm_actions = ["arn:aws:sns:eu-central-1:<account-id>:on-call"]

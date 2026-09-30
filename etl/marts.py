@@ -48,50 +48,52 @@ class _MartDefinition:
 
 _ACTIVE = "decommissioning_date IS NULL OR decommissioning_date > CURRENT_DATE"
 
-MART_DEFINITIONS: dict[str, _MartDefinition] = {
-    "installation_counts": _MartDefinition(
-        pivot="energy_source",
-        value="installation_count",
-        select_sql=f"""
-            SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
-                   energy_source, COUNT(*) AS installation_count
-            FROM (
-                SELECT state, energy_source FROM {CORE_SCHEMA}.generators
+def _mart_definitions(core_schema: str) -> dict[str, _MartDefinition]:
+    return {
+        "installation_counts": _MartDefinition(
+            pivot="energy_source",
+            value="installation_count",
+            select_sql=f"""
+                SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
+                       energy_source, COUNT(*) AS installation_count
+                FROM (
+                    SELECT state, energy_source FROM {core_schema}.generators
+                    WHERE {_ACTIVE}
+                    UNION ALL
+                    SELECT state, energy_source FROM {core_schema}.storages
+                    WHERE {_ACTIVE}
+                ) active_units
+                GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), energy_source
+            """,
+        ),
+        "generation_capacity": _MartDefinition(
+            pivot="energy_source",
+            value="generation_capacity",
+            select_sql=f"""
+                SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
+                       energy_source,
+                       ROUND(COALESCE(SUM(installed_capacity), 0)::numeric, 6)
+                           AS generation_capacity
+                FROM {core_schema}.generators
                 WHERE {_ACTIVE}
-                UNION ALL
-                SELECT state, energy_source FROM {CORE_SCHEMA}.storages
+                GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), energy_source
+            """,
+        ),
+        "storage_capacity": _MartDefinition(
+            pivot="source_type",
+            value="storage_capacity",
+            select_sql=f"""
+                SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
+                       storage_type AS source_type,
+                       ROUND(COALESCE(SUM(storage_capacity), 0)::numeric, 6)
+                           AS storage_capacity
+                FROM {core_schema}.storages
                 WHERE {_ACTIVE}
-            ) active_units
-            GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), energy_source
-        """,
-    ),
-    "generation_capacity": _MartDefinition(
-        pivot="energy_source",
-        value="generation_capacity",
-        select_sql=f"""
-            SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
-                   energy_source,
-                   ROUND(COALESCE(SUM(installed_capacity), 0)::numeric, 6)
-                       AS generation_capacity
-            FROM {CORE_SCHEMA}.generators
-            WHERE {_ACTIVE}
-            GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), energy_source
-        """,
-    ),
-    "storage_capacity": _MartDefinition(
-        pivot="source_type",
-        value="storage_capacity",
-        select_sql=f"""
-            SELECT COALESCE(state, '{OUTSIDE_STATE}') AS state,
-                   storage_type AS source_type,
-                   ROUND(COALESCE(SUM(storage_capacity), 0)::numeric, 6)
-                       AS storage_capacity
-            FROM {CORE_SCHEMA}.storages
-            WHERE {_ACTIVE}
-            GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), storage_type
-        """,
-    ),
-}
+                GROUP BY COALESCE(state, '{OUTSIDE_STATE}'), storage_type
+            """,
+        ),
+    }
+
 
 
 def build_marts(engine: Engine | None = None) -> MartsReport:
@@ -119,10 +121,11 @@ def build_marts(engine: Engine | None = None) -> MartsReport:
                 + "; run 'python -m etl load' first"
             )
         else:
-            report.created = _create_marts(engine)
-            report.refresh_times = _refresh_marts(engine)
-            report.refreshed = list(MART_DEFINITIONS)
-            report.errors = _verify_marts(engine, MART_DEFINITIONS)
+            definitions = _mart_definitions(CORE_SCHEMA)
+            report.created = _create_marts(engine, definitions)
+            report.refresh_times = _refresh_marts(engine, definitions)
+            report.refreshed = list(definitions)
+            report.errors = _verify_marts(engine, definitions)
             report.verified = not report.errors
     except Exception as e:
         report.errors.append(f"Marts failed: {e}")
@@ -143,15 +146,18 @@ def build_marts(engine: Engine | None = None) -> MartsReport:
 
 def verify_marts(engine: Engine) -> list[str]:
     """Reconcile the stored marts to live core; return the drift errors."""
-    return _verify_marts(engine, MART_DEFINITIONS)
+    return _verify_marts(engine, _mart_definitions(CORE_SCHEMA))
 
 
-def _create_marts(engine: Engine) -> list[str]:
+def _create_marts(
+    engine: Engine,
+    definitions: dict[str, _MartDefinition],
+) -> list[str]:
     """Create the marts schema and any materialized views that are missing."""
     _ensure_schema(engine, MARTS_SCHEMA)
     created: list[str] = []
     with engine.begin() as conn:
-        for name, definition in MART_DEFINITIONS.items():
+        for name, definition in definitions.items():
             exists = conn.execute(
                 text(
                     "SELECT 1 FROM pg_matviews "
@@ -173,11 +179,14 @@ def _create_marts(engine: Engine) -> list[str]:
     return created
 
 
-def _refresh_marts(engine: Engine) -> dict[str, float]:
+def _refresh_marts(
+    engine: Engine,
+    definitions: dict[str, _MartDefinition],
+) -> dict[str, float]:
     """Refresh every materialized view; return per-view elapsed seconds."""
     times: dict[str, float] = {}
     with engine.begin() as conn:
-        for name in MART_DEFINITIONS:
+        for name in definitions:
             t = time.perf_counter()
             conn.execute(text(f"REFRESH MATERIALIZED VIEW {MARTS_SCHEMA}.{name}"))
             times[name] = time.perf_counter() - t
