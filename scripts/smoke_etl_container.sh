@@ -161,48 +161,115 @@ else
     printf 'PASS: compose has no metabase service\n'
 fi
 
-step "Server variant deployment contract (compose.yaml, issue #8)"
-# The server stack must not mount the private source-data seed volume, must
-# not publish PostGIS, and must run the explicit startup-before-worker path.
-# `config` only interpolates and renders — no stack, data, or AWS needed —
-# so the required settings get dummy values here.
-server_config="$(DATABASE_URL=postgresql://etl:etl@db:5432/energy_de \
+# The command a rendered service runs, normalized to one space-separated line.
+# Compose renders `command:` as a YAML list, so the items after the key are
+# joined; a scalar form (`command: python -m etl run-all`) is taken as-is.
+service_command() {
+    awk '
+        /^ *command:/ {
+            sub(/^ *command: */, "")
+            if (length($0) > 0) { gsub(/"/, "", $0); print $0; exit }
+            collecting = 1
+            next
+        }
+        collecting && /^ *- / {
+            sub(/^ *- */, "")
+            gsub(/"/, "", $0)
+            printf "%s%s", (printed ? " " : ""), $0
+            printed = 1
+            next
+        }
+        collecting { exit }
+        END { if (printed) printf "\n" }
+    ' <<<"$1"
+}
+
+step "Bootstrap-before-worker startup order (issue #8)"
+# The event-driven server path must bootstrap before it works: `startup`
+# applies the Boundary releases and enqueues the current Source versions, and
+# only then does the worker read the queue (ADR 0009). The compose level
+# asserts the *order* (the pipeline entrypoint is the startup path, and it
+# starts only against a healthy db); the behavioural order — bootstrap before
+# the worker, fatal Boundary refusal — is verified by
+# tests/test_acceptance_workflow.py against real PostGIS with fake AWS
+# adapters, end to end.
+server_pipeline_block="$(DATABASE_URL=postgresql://etl:etl@db:5432/energy_de \
     S3_BUCKET=dummy SQS_QUEUE_URL=https://dummy SNS_TOPIC_ARN=arn:dummy \
     AWS_DEFAULT_REGION=eu-central-1 \
     VIZ_DATABASE_URL=postgresql://viz_reader:viz@db:5432/energy_de \
-    docker compose -f compose.yaml config)" || fail "compose.yaml does not render"
-if echo "$server_config" | grep -q "etl_data"; then
-    fail "server stack still references the etl_data seed volume"
+    docker compose -f compose.yaml config \
+    | sed -n '/^  pipeline:/,/^  [a-z]/p')"
+server_entrypoint="$(service_command "$server_pipeline_block")"
+if [ "$server_entrypoint" = "python -m etl startup" ]; then
+    printf 'PASS: server pipeline entrypoint is the startup path (bootstrap, then worker)\n'
 else
-    printf 'PASS: server stack mounts no source-data seed volume\n'
+    fail "server pipeline command is not the startup path (got '$server_entrypoint')"
 fi
-# nginx's 80 is the one allowed publication; anything else (PostGIS on 5432,
-# the viz app on 8501) would be a leaked internal surface.
-published_ports="$(echo "$server_config" | grep 'published:' | tr -d ' \"' | cut -d: -f2 | sort -u)"
-if [ "$published_ports" = "80" ]; then
-    printf 'PASS: server stack publishes only nginx (PostGIS stays internal)\n'
+
+step "Server variant deployment contract (compose.yaml + build_compose.yaml, issues #8/#34)"
+# The server stacks must not mount the private source-data seed volume, must
+# not publish PostGIS, and must run the explicit startup-before-worker path.
+# `config` only interpolates and renders — no stack, data, or AWS needed —
+# so the required settings get dummy values here. Both variants carry the same
+# contract: one is pulled, the other built from this repository, and a
+# deployment that differs from the tested one is a deployment nobody ran.
+for variant in compose.yaml build_compose.yaml; do
+    server_config="$(DATABASE_URL=postgresql://etl:etl@db:5432/energy_de \
+        S3_BUCKET=dummy SQS_QUEUE_URL=https://dummy SNS_TOPIC_ARN=arn:dummy \
+        AWS_DEFAULT_REGION=eu-central-1 \
+        VIZ_DATABASE_URL=postgresql://viz_reader:viz@db:5432/energy_de \
+        docker compose -f "$variant" config)" \
+        || fail "$variant does not render"
+    if echo "$server_config" | grep -q "etl_data"; then
+        fail "$variant still references the etl_data seed volume"
+    else
+        printf 'PASS: %s mounts no source-data seed volume\n' "$variant"
+    fi
+    # nginx's 80 is the one allowed publication; anything else (PostGIS on
+    # 5432, the viz app on 8501) would be a leaked internal surface.
+    published_ports="$(echo "$server_config" | grep 'published:' | tr -d ' \"' | cut -d: -f2 | sort -u)"
+    if [ "$published_ports" = "80" ]; then
+        printf 'PASS: %s publishes only nginx (PostGIS stays internal)\n' "$variant"
+    else
+        fail "$variant publishes unexpected ports: $published_ports"
+    fi
+    if echo "$server_config" | grep -q "DATABASE_URL"; then
+        printf 'PASS: %s takes its settings from the environment\n' "$variant"
+    else
+        fail "$variant does not pass DATABASE_URL from the environment"
+    fi
+    # Startup order at the compose level: the pipeline (bootstrap + worker)
+    # may not start before PostGIS is healthy.
+    pipeline_block="$(echo "$server_config" | sed -n '/^  pipeline:/,/^  [a-z]/p')"
+    if echo "$pipeline_block" | grep -q "service_healthy"; then
+        printf 'PASS: %s pipeline starts only after db is healthy\n' "$variant"
+    else
+        fail "$variant pipeline does not wait for a healthy db"
+    fi
+done
+
+step "Local variant contract preserved (local_compose.yaml, issues #13/#33)"
+# The server path must not have quietly taken the developer workflow with it:
+# the local variant still runs the CLI pass against the seeded volume and
+# still publishes the db and viz ports for host tooling.
+local_config="$(docker compose -f local_compose.yaml config)" \
+    || fail "local_compose.yaml does not render"
+if echo "$local_config" | grep -q "etl_data"; then
+    printf 'PASS: local variant still mounts the seeded etl_data volume\n'
 else
-    fail "server stack publishes unexpected ports: $published_ports"
+    fail "local variant lost the seeded etl_data seed volume"
 fi
-if echo "$server_config" | grep -q "startup"; then
-    printf 'PASS: server pipeline runs the startup-before-worker path\n'
+local_entrypoint="$(service_command "$(echo "$local_config" | sed -n '/^  pipeline:/,/^  [a-z]/p')")"
+if [ "$local_entrypoint" = "python -m etl run-all" ]; then
+    printf 'PASS: local variant still runs the containerized run-all pass\n'
 else
-    fail "server pipeline command is not the startup path"
+    fail "local variant no longer runs the run-all pass (got '$local_entrypoint')"
 fi
-if echo "$server_config" | grep -q "DATABASE_URL"; then
-    printf 'PASS: server stack takes its settings from the environment\n'
+local_ports="$(echo "$local_config" | grep 'published:' | tr -d ' \"' | cut -d: -f2 | sort -u | tr '\n' ' ')"
+if [ "$local_ports" = "5433 8501 " ]; then
+    printf 'PASS: local variant publishes the db and viz ports (5433, 8501)\n'
 else
-    fail "server stack does not pass DATABASE_URL from the environment"
-fi
-# Startup order at the compose level: the pipeline (bootstrap + worker) may
-# not start before PostGIS is healthy. The behavioural order — bootstrap
-# before the worker, fatal Boundary refusal — is verified by
-# tests/test_ingestion.py against real PostGIS with fake AWS adapters.
-pipeline_block="$(echo "$server_config" | sed -n '/^  pipeline:/,/^  [a-z]/p')"
-if echo "$pipeline_block" | grep -q "service_healthy"; then
-    printf 'PASS: server pipeline starts only after db is healthy\n'
-else
-    fail "server pipeline does not wait for a healthy db"
+    fail "local variant publishes unexpected ports: $local_ports"
 fi
 
 step "Bringing up the viz service (Streamlit, port ${VIZ_PORT})"

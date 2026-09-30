@@ -1,9 +1,9 @@
-# CI smoke gates (issue #14, extended by #10): three cheap invariants on push to
-# `main` and on pull requests — the Python code byte-compiles, the pipeline and
-# viz container images still build, and the Terraform configuration is formatted
-# and valid. Never fetches or requires the private raw data set, never runs the
-# integration suite (that needs a PostGIS dev DB + the raw data), never needs AWS
-# credentials.
+# CI smoke gates (issue #14, extended by #10, #36): the cheap invariants on push
+# to `main` and on pull requests — the Python code byte-compiles, the pipeline and
+# viz container images still build, the Terraform configuration is formatted and
+# valid, and every compose variant still renders the deployment contract it claims.
+# Never fetches or requires the private raw data set, never runs the integration
+# suite (that needs a PostGIS dev DB + the raw data), never needs AWS credentials.
 
 name: CI
 
@@ -85,3 +85,49 @@ jobs:
 
       - name: Terraform configuration tests
         run: python -m pytest tests/test_terraform_config.py -q
+
+  compose-config:
+    name: Compose config render + contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # `docker compose config` interpolates and renders the committed compose
+      # files without creating a stack, pulling an image, or contacting AWS, so
+      # the container deployment contract is as cheap a gate as the Terraform
+      # one. Each variant is rendered on its own because the server variants take
+      # their settings from required environment variables.
+      - name: Render the server compose variants
+        run: |
+          for variant in compose.yaml build_compose.yaml; do
+            echo "::group::$variant"
+            DATABASE_URL=postgresql://etl:etl@db:5432/energy_de \
+              VIZ_DATABASE_URL=postgresql://viz_reader:viz@db:5432/energy_de \
+              S3_BUCKET=ci-dummy-bucket \
+              SQS_QUEUE_URL=https://sqs.eu-central-1.amazonaws.com/000000000000/ingestion \
+              SNS_TOPIC_ARN=arn:aws:sns:eu-central-1:000000000000:alerts \
+              AWS_DEFAULT_REGION=eu-central-1 \
+              docker compose -f "$variant" config --quiet
+            echo "::endgroup::"
+          done
+
+      - name: Render the local compose variant
+        run: docker compose -f local_compose.yaml config --quiet
+
+      # The tests assert what each rendered variant *must* look like (the
+      # startup-before-worker entrypoint, the seed volume, the published ports).
+      # They need no database, no raw data, no credentials — and they skip
+      # themselves if `docker compose` is unavailable.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Compose configuration tests
+        run: python -m pytest tests/test_compose_config.py -q
