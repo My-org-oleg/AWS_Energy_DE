@@ -9,7 +9,7 @@ and commissioning date, and a Streamlit + PyDeck map app that visualises the mar
 Implemented. The ETL pipeline (extract → staging → core → marts) runs end-to-end via the CLI
 (`python -m etl <stage>`, or `run-all` for the whole pass; Click hyphenates the `run_all`
 Python function name) and is covered by a full integration
-test suite (pytest, 499 tests against a dedicated scratch PostGIS database), and the
+test suite (pytest, 534 tests against a dedicated scratch PostGIS database), and the
 Streamlit viz app
 (`viz/`, T1–T4, no-auth map with per-source icon layers (IconLayer), area choropleth and header
 aggregates) runs in the containerized stack. Design work recorded in:
@@ -33,7 +33,10 @@ aggregates) runs in the containerized stack. Design work recorded in:
   alarms, #10; operator steps in `terraform/README.md`, decisions in
   `docs/adr/0010-terraform-deployment-contract.md`)
 - GitHub Actions (`.github/workflows/ci.yml`: byte-compile + pipeline/viz image build +
-  `terraform fmt`/`validate` on every push/PR, #14/#10; `.github/workflows/publish-docker.yml`:
+  `terraform fmt`/`validate` + the Terraform config tests, and `docker compose config` +
+  the Compose contract tests, on every push/PR, #14/#10/#36; decisions in
+  `docs/adr/0011-layered-verification-contract.md`;
+  `.github/workflows/publish-docker.yml`:
   pushes both images to Docker Hub as `khvostenko/aws-energy-etl` /
   `khvostenko/aws-energy-viz` on `main`)
 
@@ -245,7 +248,7 @@ The suite is hermetic: it needs its own database and nothing else — no raw dat
 pre-seeded dev database, and it never reads `data/`.
 
 ```sh
-.venv/bin/python -m pytest                                 # 499 tests, ~65s
+.venv/bin/python -m pytest                                 # 534 tests, ~55s
 ```
 
 Set `TEST_DATABASE_URL` in `.env` (see `.env.example`) to any throwaway database name —
@@ -257,6 +260,15 @@ the same database as `DATABASE_URL`, and with `TEST_DATABASE_URL` unset it overw
 
 Source and boundary inputs are the small committed fixtures in `tests/fixtures/`;
 regenerate them with `python scripts/make_test_fixtures.py` after editing that script.
+
+Verification is layered (`docs/adr/0011-layered-verification-contract.md`):
+`tests/test_acceptance_workflow.py` walks the whole event-driven loop once — `startup`
+→ `worker` → `redrive` — through the real processor against a real PostGIS with fake AWS
+adapters, and names the guarantee that failed; `tests/test_compose_config.py` renders the
+three compose variants and asserts the deployment contract (no stack, no database, no raw
+data); `tests/test_terraform_config.py` pins the Terraform delivery contract to
+`etl/ingestion.py`. The two contract tests need no database and run in CI too; the
+walkthrough is part of the suite above and stays off CI, which has no PostGIS service.
 
 ### Reset / clean slate
 

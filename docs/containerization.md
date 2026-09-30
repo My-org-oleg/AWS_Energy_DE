@@ -285,22 +285,46 @@ smoke runs its stack against the **local** variant (it pins
 `COMPOSE_FILE=local_compose.yaml` to probe the app over its published port);
 the server variant's nginx entry is verified by its own
 `/_stcore/health`-through-the-proxy healthcheck in compose, and the startup
-order (bootstrap before the worker, fatal-Boundary refusal) is verified by
-`tests/test_ingestion.py` against real PostGIS with fake AWS adapters.
+order (bootstrap before the worker, fatal-Boundary refusal) is verified against
+real PostGIS with fake AWS adapters by `tests/test_acceptance_workflow.py` (the
+whole loop: `startup` → `worker` → `redrive`) and, for the unit-level rules,
+`tests/test_ingestion.py`.
 Re-run it any time the packaging changes:
 
 ```bash
 scripts/smoke_etl_container.sh
 ```
 
+The parts of the deployment contract that need no stack, no database and no raw
+data are asserted separately, so drift there is a pull-request failure rather
+than a surprise on the machine that owns the data:
+`tests/test_compose_config.py` renders all three variants with `docker compose
+config` and asserts the command, the mounts, the ports and the env, and
+`tests/test_terraform_config.py` pins the accepted keys and the delivery contract
+to `etl/ingestion.py`. Both run in CI as well (ADR 0011,
+`docs/adr/0011-layered-verification-contract.md`); this script stays the seam
+that exercises the real images and a real database.
+
 ## CI & publishing
 
 Two GitHub Actions workflows keep the images honest:
 
-- `.github/workflows/ci.yml` (issue #14) — cheap smoke gates on every push to
-  `main` and pull request: byte-compiles `etl`/`viz`/`tests`/`scripts`/`docker`
-  and builds **both** the pipeline and viz images. Never requires the private
-  raw data and never runs the integration suite.
+- `.github/workflows/ci.yml` (issues #14, #10, #36) — four cheap gates on every push to
+  `main` and pull request, none of which needs a database, the raw data or AWS
+  credentials:
+  - **Compile check** — byte-compiles `etl`/`viz`/`tests`/`scripts`/`docker`.
+  - **Image build** — builds **both** the pipeline and viz images.
+  - **Terraform** — `init -backend=false`, `fmt -check`, `validate`, then
+    `tests/test_terraform_config.py`, which pins the accepted keys and the delivery
+    contract to `etl/ingestion.py`.
+  - **Compose** — `docker compose config` on `compose.yaml`, `build_compose.yaml` and
+    `local_compose.yaml` (interpolation only: no stack, no image, no database), then
+    `tests/test_compose_config.py`, which asserts the command, mounts, ports and env
+    and skips when `docker compose` is unavailable.
+
+  The integration suite is deliberately **not** in CI: it needs a PostGIS service,
+  which CI has none of. It runs locally (ADR 0011,
+  `docs/adr/0011-layered-verification-contract.md`).
 - `.github/workflows/publish-docker.yml` — on every push to `main`, builds and
   pushes the images to Docker Hub as `khvostenko/aws-energy-etl` and
   `khvostenko/aws-energy-viz` (both tagged `latest`, the tags `compose.yaml` pulls).
@@ -361,7 +385,10 @@ seed. Re-running `docker volume create` is idempotent.
 - #13 containerization
 - #14 CI smoke gates (compile check + pipeline image build) — `.github/workflows/ci.yml` now
   lives in CI: byte-compile (`python -m compileall`) + `docker build` of the pipeline and viz
-  images on push to `main` and pull requests, no raw data and no integration suite; a publish
+  images on push to `main` and pull requests, later extended by #10 with the Terraform
+  `fmt`/`validate` gate plus `tests/test_terraform_config.py`, and by #36 with the Compose
+  render plus `tests/test_compose_config.py` — still no raw data, no database and no
+  integration suite; a publish
   workflow (`.github/workflows/publish-docker.yml`) pushes both images to Docker Hub on `main`
 - #15 Metabase was joined to this compose stack and from #28 **removed** in
   favour of the Streamlit viz app; the marts are the still-authoritative

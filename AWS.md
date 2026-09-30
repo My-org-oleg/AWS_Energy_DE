@@ -12,11 +12,45 @@
 - When source file appears in source/ folder, S3 Event Notification triggers ETL
 - ETL-worker runs constantly
 - Event s3:ObjectCreated goes to SQS + DLQ
-- ETL-worker loads file from s3 to /tmp folder, after finishing ETL erases it.
+- The worker reads the object *version* S3 named in the event, writes its bytes to a
+  temporary `.gpkg` only long enough for GeoPandas to open the layer, and unlinks that file
+  before the stages run. Nothing is left on the host to clean up afterwards
 - Energy source resolves through energy_source column in dataframe (not through filename) 
 - Transform stage receives table name to transform. 
 - All files are treated consequently via SQS 
 - All extracted files are logged in loaded_files table and not extracted twice.
+
+### The accepted keys and the snapshot contract (issue #36)
+- The bucket has **ten accepted keys and no others**: `sources/<energy source>.gpkg` for the
+  six Source datasets and `boundaries/level-<0-3>.gpkg` for the four Boundary levels
+  (`etl.ingestion.ACCEPTED_KEYS`, mirrored in `terraform` as `local.accepted_keys` and pinned
+  against Python by `tests/test_terraform_config.py`). There is no manifest, no discovery and
+  no folder convention: an upload to a key that is not one of the ten is never read, and the
+  instance profile is not granted a read on it either
+- S3 **versioning is what identifies an upload**. Every Ingestion run, ledger row and duplicate
+  check is keyed by `(bucket, key, object version)`, so a corrected publication is a new
+  version and a new run, and two uploads of the same filename can never be confused for one
+  another. Turn versioning on before the first upload (`terraform/s3.tf`)
+- A **Source snapshot is complete and authoritative** for the units it contains: it restates
+  every one of them, and what it does not carry is stated by its absence. A newer snapshot
+  therefore updates the units it carries in place, never re-creates them, and never deletes
+  the units it omits — those stay in Core as history with their identity, and stop being
+  members of the Source (lineage in `service.source_memberships`). Only commissioning and
+  decommissioning dates decide whether a unit is Active
+- A **Boundary release replaces only the level it was published under** and rederives every
+  unit's state/region/district from the new polygons, historical Core rows included, so the
+  marts pivot on the new names without any Source snapshot to carry them
+
+### What the service records (ADR 0007)
+Operational state lives in the `service` schema, deliberately apart from the versioned raw
+datalake, so "what happened to that file" is one place to look:
+- `ingestion_runs` — one row per S3 object version: `source` or `boundary` input kind, state
+  (`running`, `succeeded`, `stale`, `terminal`, `retryable`), attempt count, and the terminal
+  error. This is the answer to "was it loaded, skipped, retried or failed, and why"
+- `loaded_files` — the success ledger: an object version is loaded once and never re-extracted
+- `source_memberships` — which units a given snapshot contained, and which of them were bad
+  quality
+- `boundaries` — the level-coded reference layer the spatial joins read
 
 ### The message contract (issue #6)
 - The worker receives **one** SQS message at a time (long polling) and decodes every S3 record it carries. Separate messages are never combined, because one message is also one acknowledgement
@@ -78,3 +112,23 @@ because a container cannot count on reaching the instance metadata service
 - The AWS provider has no resource for attaching an instance profile, so the attachment is one
   `aws ec2 modify-instance-attribute` call and a Terraform `check` block warns on later plans
   when the host is not running under the profile
+
+## 7. What this design deliberately does not do
+- **No S3 event filtering beyond the file extension.** S3 accepts one prefix/suffix filter per
+  notification configuration, so the configuration filters `.gpkg` and the exact ten keys are
+  enforced where they can be exact: the worker rejects anything else, and the instance
+  profile grants a read on the accepted keys only
+- **No manifest, no discovery, no per-run configuration.** The key layout *is* the interface;
+  adding an Energy source is a code change (a fixed key plus its transform), not an upload
+- **No partial boundary releases.** The four levels are one geography: a release is applied as
+  a batch and one invalid level rejects the whole batch, so a bad file can never half-apply
+- **No deletion of loaded data.** Core rows and raw versions are never removed by a later
+  snapshot; a unit that leaves a Source dataset stays as history. Correcting data means
+  publishing a new version
+- **No retry of a file that failed its own validation.** An S3 version is immutable, so
+  validating it again reaches the same verdict; the run is terminal and the operator uploads a
+  new version (see §2, "Retries, rejection, DLQ, and alerting")
+- **No write access for the visualization.** The app connects as `viz_reader`, which never
+  receives `INSERT/UPDATE/DELETE`
+- **No batch path in the server deployment.** `run-all` over a mounted data volume is the
+  local workflow (`local_compose.yaml`); the server stack mounts no data volume at all

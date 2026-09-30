@@ -9,8 +9,8 @@ disagree, the code wins and the discrepancy is called out (see
 - **Lineage** — which key identifies a record at each hop
 - **Data layers** — the five schemas, their tables and their keys
 - **AWS integration** — the event path, the container stack, CI/CD
-- **Planned, not yet built** — what the design docs promise and the code has not
-  reached
+- **What is left to the account** — the steps that need the AWS account or a
+  human, not another line of code here
 
 Physical schema names default to `raw`, `stage`, `core`, `service`, `marts`
 (`etl/config.py`; each is overridable per environment). The layer is called
@@ -368,7 +368,7 @@ flowchart TB
     POLL --> VIS["visibility extended to 6h,<br/>re-extended every minute"]
     POLL --> RUN["resolve the served version<br/>(head_object)"]
     RUN -->|"older than a succeeded run"| STALE["stale → settled, not retried"]
-    RUN --> READ["GetObject(version_id) → /tmp, deleted after"]
+    RUN --> READ["GetObject(version_id) → temp GPKG,<br/>unlinked after inspect"]
     READ --> LEDGER["service.ingestion_runs"]
     POLL --> DEL["DeleteMessage when every record<br/>is succeeded / terminal / stale"]
     READ -->|"content validation fails"| REJ["terminal → one SNS alert:<br/>upload a new version"]
@@ -378,13 +378,20 @@ flowchart TB
     POLL -.-> LOGS
 ```
 
-The event wiring above is *designed* (AWS.md §2): the S3 notification, the SQS
-forwarding, the redrive policy and the DLQ alarm live in the account, not in this
-repo. What runs today is the receive loop — `ingestion.run_worker` polls with
-long polling and hands each message to `process_one_message` alone — plus the CLI
-pass. A rejected object version is announced by the worker; a message that runs out of
-deliveries is announced by the DLQ alarm, so each problem is alerted once
-([§6](#6-planned-not-yet-built) lists what the account still owes).
+The event wiring above is Terraform (`terraform/s3.tf`, `terraform/sqs.tf`,
+`terraform/cloudwatch.tf`): the S3 notification onto the queue, the redrive
+policy with `maxReceiveCount = 5`, and the DLQ alarm are declared in this repo
+and applied to the account (ADR 0010). The delivery contract those resources
+carry is pinned against `etl/ingestion.py` by `tests/test_terraform_config.py`.
+
+What the pipeline container runs is `python -m etl startup` and then the worker
+loop: the startup applies the current Boundary releases, enqueues the Source
+object versions that have no run yet, and refuses to start the worker when a
+Boundary level is missing (ADR 0009). A rejected object version is announced by
+the worker; a message that runs out of deliveries is announced by the DLQ alarm,
+so each problem is alerted once. The receive loop is verified end to end, startup
+through redrive, by `tests/test_acceptance_workflow.py`
+([§6](#6-what-is-left-to-the-account) lists what is left to the account).
 
 The bucket key is the contract: `sources/<source>.gpkg` and
 `boundaries/level-<n>.gpkg` are the only accepted keys, and the key alone
@@ -454,12 +461,27 @@ flowchart LR
     MAIN["push to main"] --> PUB["publish-docker.yml"]
     PUB --> HUB[("Docker Hub<br/>khvostenko/aws-energy-etl<br/>khvostenko/aws-energy-viz")]
     HUB --> COMPOSE["docker compose pull"]
-    PR["any push / PR"] --> CI["ci.yml<br/>compileall + image builds"]
+    PR["any push / PR"] --> CI["ci.yml — four cheap gates"]
+    CI --> CC["compileall"]
+    CI --> IB["both image builds"]
+    CI --> TV["terraform fmt + validate<br/>+ test_terraform_config.py"]
+    CI --> KCF["compose config render<br/>+ test_compose_config.py"]
 ```
 
-CI is cheap on purpose: byte-compile every module and build both images. The
-full integration suite needs a PostGIS service and the private data, so it runs
-locally (`TEST_DATABASE_URL` against a scratch database) rather than in CI.
+Every gate needs no PostGIS, no raw data and no AWS credentials, so a renamed
+CLI command or a changed port fails a pull request instead of a deployment:
+byte-compile, both image builds, `terraform fmt -check` / `init -backend=false` /
+`validate` plus `tests/test_terraform_config.py` (which pins the accepted keys and
+the delivery contract to `etl/ingestion.py`), and `docker compose config` on all
+three variants plus `tests/test_compose_config.py` — the container contract that
+used to be reachable only through `scripts/smoke_etl_container.sh`, which needs
+the private data set (ADR 0011).
+
+The full integration suite needs a PostGIS service, so it runs locally
+(`TEST_DATABASE_URL` against a scratch database) rather than in CI. The acceptance
+walkthrough belongs to that suite, not to CI: it drives `startup`, `worker` and
+`redrive` through the real processor against a real PostGIS with fake AWS
+adapters, which is exactly the heavy flow CI has no service for.
 
 ---
 
@@ -476,18 +498,24 @@ picture:
 - `service` holds the boundary reference layer, not `raw.boundaries` (ADR 0007
   superseded that part of ADR 0004).
 
-## 6. Planned, not yet built
+## 6. What is left to the account
 
-From `AWS.md` and the parent issue #1, so this picture is not read as done:
+The event wiring, the infrastructure and the operator startup all exist in this
+repo (ADR 0009, ADR 0010, ADR 0011); what no code here can do is put them in the
+account:
 
-- **The account-side event wiring.** The worker receives, retries, rejects,
-  alerts and dead-letters correctly, but the S3 notification forwarding to SQS,
-  the queue's `maxReceiveCount = 5` redrive policy and the DLQ CloudWatch alarm
-  are AWS-side configuration (Terraform, issue #10). Until they exist, a message
-  is retried by the queue's own visibility timeout and an exhausted message is
-  only visible in the logs.
-- **Terraform** (`AWS.md` §6) and the admin/API surfaces in the spec's Serving
-  section do not exist.
-- **Operator startup.** The worker has no Compose service or documented
-  `docker compose` path yet (issue #8): `python -m etl worker` is the only way to
-  run it, and bootstrap enqueueing of boundary objects is part of that slice.
+- **The apply, and the two steps the provider cannot take.** Attaching the
+  instance profile to the running host, and installing the rendered CloudWatch
+  agent config, are one CLI call and one file each (`terraform/README.md`). The
+  SNS email subscription stays silent until the operator clicks the
+  confirmation.
+- **The data itself.** The bucket is empty until an upload happens: six Source
+  snapshots and four Boundary levels under the ten accepted keys, with object
+  versioning on. Until then startup has nothing to enqueue, no message reaches
+  the worker, and every layer above `service` stays empty.
+- **The host.** Terraform creates no EC2 instance, no VPC and no RDS — the
+  Compose stack and its PostGIS run on a host the account already has.
+
+One thing is absent by design rather than by omission: the admin and API surfaces
+in the spec's Serving section do not exist. `AWS.md` §7 lists the rest of the
+non-goals.

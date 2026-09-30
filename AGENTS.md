@@ -9,6 +9,12 @@ seed, read-only `viz_reader` role provisioning (dev-host SQL seam in
 `docker/viz_reader.sql`), and a smoke seam (`local_compose.yaml`,
 `scripts/seed_data_volume.sh`, `scripts/smoke_etl_container.sh`; see
 `docs/containerization.md`).
+The event-driven deployment is the AWS one: an S3 upload becomes an SQS message, and
+`python -m etl startup` (bootstrap, apply Boundary releases, enqueue) followed by
+`python -m etl worker` ingests the six Source snapshots and four Boundary levels under the
+ten fixed bucket keys, with `python -m etl redrive` for recovery from the ledger (#36,
+ADR 0009). The whole loop is walked once end to end by
+`tests/test_acceptance_workflow.py` (see Verification).
 The AWS deployment's infrastructure is Terraform (`terraform/`): S3 bucket, SQS
 queue + DLQ, SNS topic, EC2 instance profile, CloudWatch log groups/metrics/alarms
 (#10), with an operator hand-off in `terraform/README.md` and the decisions in
@@ -72,17 +78,28 @@ does not exist yet is enough. The suite **refuses to run** if `TEST_DATABASE_URL
 at the same database as `DATABASE_URL`, and with `TEST_DATABASE_URL` unset it overwrites
 `DATABASE_URL` with an unreachable placeholder so no test can reach dev data. The viz
 unit seams (`tests/test_viz_*.py`) take no database but do need `requirements-viz.txt`
-installed. `tests/test_terraform_config.py` takes no database either: it parses
+installed. Verification is layered (`docs/adr/0011-layered-verification-contract.md`):
+`tests/test_acceptance_workflow.py` is part of the suite above and walks the whole
+event-driven loop once through the deployment's own entry points — `startup`, then
+`worker` per message, then `redrive` — against a real `PipelineProcessor` on a real
+PostGIS with fake AWS adapters from the shared harness (`tests/ingestion_harness.py`,
+which `tests/test_ingestion.py` imports too), asserting per-phase state; the fakes
+hold the queue, so they own delivery counting. `tests/test_terraform_config.py` takes
+no database either: it parses
 `terraform/*.tf` with `python-hcl2` (pinned `<5.0` in `requirements-dev.txt`, because 5.x
 returns a different shape), and pins the accepted-key layout and the delivery contract
-against `etl/ingestion.py`. The containerized stack has its own smoke
+against `etl/ingestion.py`. `tests/test_compose_config.py` also takes no database: it
+renders all three compose variants with `docker compose config` (interpolation only) and
+asserts commands, mounts, ports and env, skipping when `docker compose` is unavailable.
+The containerized stack has its own smoke
 seam (`scripts/smoke_etl_container.sh`, #13; extended by #28 for db + pipeline + viz).
-CI (`.github/workflows/ci.yml`, #14/#10) does *not* run the integration suite — it runs
-cheap gates only (byte-compile via `python -m compileall`, pipeline/viz image builds, and
-`terraform fmt -check` + `init -backend=false` + `validate` via `hashicorp/setup-terraform`
-plus `tests/test_terraform_config.py`, which needs no database, no data and no
-credentials), because it has no PostGIS service — and must never require the raw data or AWS
-credentials. The publish workflow
+CI (`.github/workflows/ci.yml`, #14/#10/#36) does *not* run the integration suite — it runs
+four cheap gates, all of which need no database, no data and no AWS credentials: byte-compile
+via `python -m compileall`, pipeline/viz image builds, `terraform fmt -check` +
+`init -backend=false` + `validate` via `hashicorp/setup-terraform` plus
+`tests/test_terraform_config.py`, and the compose render plus
+`tests/test_compose_config.py`. CI has no PostGIS service — and must never require the raw
+data or AWS credentials. The publish workflow
 (`.github/workflows/publish-docker.yml`) pushes both images to Docker Hub
 (`khvostenko/aws-energy-etl`, `khvostenko/aws-energy-viz`) on `main`, which `compose.yaml`
 pulls (`build_compose.yaml`/`local_compose.yaml` still build from source).
