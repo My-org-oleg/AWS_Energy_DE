@@ -98,15 +98,20 @@ locals {
   # worker and retry exhaustion by the DLQ alarm, so a third alert path over the
   # same lines would report one problem twice.
   #
-  # A leading `?` means "at least one character precedes the term". The Docker
-  # json-file driver makes every stdout line its own log event, so the two report
-  # lines that start with the two-space indent of the CLI's report block carry
-  # it, and the worker's own banner — which starts its own line — must not.
+  # A pattern is the words of the line it counts, in the order they appear.
+  # Two things are barred here, and both are invisible until CloudWatch acts:
+  # PutMetricFilter rejects a filter whose unquoted term carries a character
+  # outside `[A-Za-z0-9_.-]` — it fails the whole resource with `Invalid
+  # character(s) in term`, and the colon in the two report lines above is
+  # exactly that — while a leading `?` is not an anchor but CloudWatch's
+  # JSON-field existence selector, which parses and then never fires, because
+  # these events are plain text. tests/test_terraform_config.py models both
+  # rules, so a pattern carrying either fails the build rather than the apply.
   worker_metric_patterns = {
     WorkerStarted   = "Ingestion worker reading"
-    StartupBlocked  = "?Worker start     : blocked"
-    BoundaryApplied = "?Boundary release : applied"
-    WorkerErrors    = "?ERROR etl"
+    StartupBlocked  = "Worker start blocked"
+    BoundaryApplied = "Boundary release applied"
+    WorkerErrors    = "ERROR etl"
   }
 
   tags = merge(

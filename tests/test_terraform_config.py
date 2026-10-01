@@ -54,10 +54,17 @@ ETL_MAIN = REPO_ROOT / "etl" / "__main__.py"
 SIX_HOURS = 6 * 60 * 60
 FOURTEEN_DAYS = 14 * 24 * 60 * 60
 
-# The line each worker metric counts, written the way the worker emits it. In a
-# CloudWatch pattern a term matches anywhere in the log event, and a `?` in
-# front of it requires at least one character before it — so whether a pattern
-# carries a `?` is a fact about the line it counts, not a matter of taste.
+# The characters CloudWatch accepts in an unquoted filter-pattern term. Anything
+# else in one is rejected, and a `?term` selector is CloudWatch's JSON-field
+# existence test — legal syntax that can only fire on a JSON-formatted event.
+_TERM_CHARS = re.compile(r"[A-Za-z0-9_.-]+")
+_JSON_SELECTOR = re.compile(r"^\?")
+_TERM_TOKEN = re.compile(r'"[^"]*"|\S+')
+
+# The line each worker metric counts, written the way the worker emits it. A
+# filter pattern matches a plain-text event term by term, each term anywhere in
+# the line and in the order the pattern lists them, which is the whole of the
+# semantics these patterns rely on.
 WORKER_LOG_LINES = {
     # The worker prints its queue URL on the line it starts reading.
     "WorkerStarted": "Ingestion worker reading https://sqs.eu-central-1.amazonaws.com/1/q",
@@ -229,18 +236,55 @@ def _granted_actions(statements: dict[str, dict]) -> set[str]:
     }
 
 
-def _cloudwatch_matches(pattern: str, line: str) -> bool:
-    """Whether a CloudWatch filter pattern matches a log line.
+def _cloudwatch_terms(pattern: str) -> list[tuple[str, bool, bool]]:
+    """`(text, quoted, selector)` for every term of a filter pattern.
 
-    CloudWatch looks for each term of a pattern anywhere in the event, in any
-    order, and a `?` in front of a term requires at least one character before
-    it. That is the whole of the semantics these patterns rely on.
+    A term is either a bare word or a double-quoted phrase, and a bare word may
+    carry a leading `?`. Splitting on whitespace alone would tear a quoted
+    phrase apart, so the terms are tokenized instead.
     """
-    for term in pattern.split():
-        anchored = term.startswith("?")
-        index = line.find(term.lstrip("?"))
-        if index < 0 or (anchored and index == 0):
+    terms = []
+    for token in _TERM_TOKEN.findall(pattern):
+        quoted = len(token) > 1 and token.startswith('"') and token.endswith('"')
+        text = token[1:-1] if quoted else token
+        terms.append((text, quoted, bool(_JSON_SELECTOR.match(text))))
+    return terms
+
+
+def _cloudwatch_rejection(pattern: str) -> str | None:
+    """Why `PutMetricFilter` would refuse this pattern, or `None` if it takes it.
+
+    A filter pattern is one string to CloudWatch, so a single bad term fails the
+    whole resource — and `Invalid character(s) in term 'X'` is what an unquoted
+    term carrying a character outside `[A-Za-z0-9_.-]` gets, the colon in a
+    report line being the case that reached the apply. A leading `?` is
+    stripped before the check: it is legal syntax, and a separate rule says a
+    selector cannot fire on plain text.
+    """
+    for text, quoted, _selector in _cloudwatch_terms(pattern):
+        if not quoted and not _TERM_CHARS.fullmatch(text.lstrip("?")):
+            return f"term {text!r} is rejected unquoted by PutMetricFilter"
+    return None
+
+
+def _cloudwatch_matches(pattern: str, line: str) -> bool:
+    """Whether a CloudWatch filter pattern matches a plain-text log line.
+
+    Each term has to appear in the line, in the order the pattern lists them,
+    and a quoted term is a phrase rather than a single word. A `?term` selector
+    tests for a field in a JSON event, so on plain text it can never fire and
+    the pattern matches nothing however well its words fit — a metric that
+    publishes zeros while looking configured.
+    """
+    terms = _cloudwatch_terms(pattern)
+    if any(selector for _text, _quoted, selector in terms):
+        return False
+    position = 0
+    for text, _quoted, _selector in terms:
+        index = line.find(text, position)
+        if index < 0:
             return False
+        position = index + len(text)
     return True
 
 
@@ -668,11 +712,11 @@ def test_worker_metrics_come_from_the_compose_log_group(config):
 def test_every_worker_metric_pattern_matches_a_line_the_worker_prints(config):
     """Each pattern can actually match the line it was written for.
 
-    The Docker json-file driver makes every stdout line its own log event, so
-    "at the start of the event" is "at the start of the line". A `?` on a line
-    that starts its own text is therefore a filter that can never fire — a
-    metric that publishes nothing while looking configured, which is the one
-    failure a parsed-configuration test is otherwise blind to.
+    A pattern that cannot match the line it was written for is a metric that
+    publishes zeros while looking configured, which is the one failure a
+    parsed-configuration test is otherwise blind to. A `?` selector is the sharp
+    end of that: it tests for a field in a JSON event, so on the worker's plain
+    text it matches nothing at all however well its words fit.
     """
     patterns = _locals(config)["worker_metric_patterns"]
     assert set(patterns) == set(WORKER_LOG_LINES), (
@@ -694,6 +738,24 @@ def test_every_worker_metric_pattern_matches_a_line_the_worker_prints(config):
     assert "%(levelname)s %(name)s:" in _log_format(), (
         "the error pattern counts the lines this log format renders"
     )
+
+
+def test_every_worker_metric_pattern_is_one_cloudwatch_accepts(config):
+    """CloudWatch refuses a whole metric filter over one unusable term.
+
+    `PutMetricFilter` takes the pattern as a single string, so a term carrying
+    a character outside `[A-Za-z0-9_.-]` unquoted fails the entire resource
+    with `Invalid character(s) in term` — the colon separating a report line's
+    label from its value is exactly that, and it reached the apply because
+    parsing the HCL cannot know CloudWatch's grammar. Asserting the rejection
+    here is what turns an `InvalidParameterException` in the account into a
+    failed test run.
+    """
+    for metric, pattern in _locals(config)["worker_metric_patterns"].items():
+        assert _cloudwatch_rejection(pattern) is None, _cloudwatch_rejection(pattern)
+        assert not any(
+            selector for _text, _quoted, selector in _cloudwatch_terms(pattern)
+        ), f"{metric} uses a ?term selector, which only fires on a JSON event"
 
 
 def test_no_alarm_announces_exhaustion_twice(config):
@@ -863,13 +925,19 @@ def test_deployment_documentation_covers_the_handoff():
     """The apply steps and the operator hand-off are written down.
 
     Terraform is only reproducible if the next person can find the variables,
-    the outputs, and the steps that follow an apply — installing the agent
-    config and pointing Compose at the outputs.
+    the outputs, and the steps that follow an apply — installing the agent,
+    installing its config, and pointing Compose at the outputs. The agent itself
+    is in the list because a hand-off that starts at the config file leaves the
+    one step that needs Amazon's package unexplained. The config's full path is
+    pinned because it is the agent's default: the unit passes no `-c`, so a file
+    named anything else leaves the service crashing with exit code 1.
     """
     readme = TERRAFORM_README.read_text(encoding="utf-8")
     for topic in (
         "terraform apply",
         "terraform output",
+        "amazon-cloudwatch-agent.deb",
+        "/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json",
         "cloudwatch_agent_config",
         "SQS_QUEUE_URL",
         "SNS_TOPIC_ARN",

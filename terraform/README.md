@@ -29,6 +29,44 @@ path, so the agent ships every container to the one Compose group as one stream
 per container, rather than claiming a group per service. The two post-apply
 steps below are what put the agent's own log where it can be found.
 
+## Install Terraform
+
+The host does not need Terraform to *run* the stack — only to change it. The
+`apply` can happen on any machine that holds AWS credentials, and the host
+consumes nothing but the outputs below. When the commands do run on the host,
+use the version this repository pins: CI validates with `1.9.5` and
+`required_version` is `>= 1.6.0`, so a newer release is allowed and an older
+one is not.
+
+```bash
+TF_VERSION=1.9.5
+ARCH=amd64                      # arm64 on a Graviton instance
+cd /tmp
+curl -fsSLO "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_${ARCH}.zip"
+curl -fsSLO "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_SHA256SUMS"
+grep "terraform_${TF_VERSION}_linux_${ARCH}.zip" terraform_${TF_VERSION}_SHA256SUMS | sha256sum -c -
+unzip -o terraform_${TF_VERSION}_linux_${ARCH}.zip
+sudo install -m 0755 terraform /usr/local/bin/terraform
+terraform -version
+```
+
+The checksum line is why the pinned binary is the default route: the archive is
+verified against the release HashiCorp signs, and a mismatch aborts before
+anything is unpacked. Two alternatives, neither of which pins a version:
+
+- **apt** — `https://apt.releases.hashicorp.com` installs whatever the newest
+  release is, and needs a supported Ubuntu codename; a distribution released
+  recently has no `dists` entry yet.
+- **The container image** — nothing to install at all, and the same version CI
+  uses. Bind-mount this directory so state persists outside the container, and
+  hand it credentials from the host:
+
+  ```bash
+  docker run --rm -v "$PWD/terraform:/tf" -w /tf \
+    -e AWS_PROFILE -e AWS_REGION -v "$HOME/.aws:/root/.aws:ro" \
+    hashicorp/terraform:1.9.5 <init|plan|apply|fmt|validate>
+  ```
+
 ## Apply
 
 Credentials come from the operator's ambient AWS configuration (environment,
@@ -42,6 +80,13 @@ terraform init
 terraform plan
 terraform apply
 ```
+
+One bootstrap caveat if the first apply runs on the instance itself: the
+instance profile it needs is what this apply creates, so a host without a
+profile yet cannot authenticate. Run that first apply from a machine that has
+credentials — the role and profile it creates are then attached to the host by
+the first of the two steps below, and every later `plan`/`apply` can be run from
+there.
 
 `ec2_instance_id` is the only required value. Names default to
 `<name_prefix>-<account id>-data` for the bucket and `<name_prefix>-ingestion`,
@@ -74,14 +119,62 @@ Every later `terraform plan` checks this and names the instance if it drifts, so
 a host that was recreated without the profile is caught rather than discovered
 by a worker that cannot read S3.
 
-**2. Install the CloudWatch agent config.** The rendered config is an output, so
-it always matches the log groups this apply created:
+**2. Install the CloudWatch agent, then its config.** The agent is the thing that
+actually ships the container logs; the config below only tells it where to put
+them, and the config is an output so it always matches the log groups this
+apply created. The package is not in Ubuntu's own repositories, so it comes from
+Amazon — as a signed `.deb`, which `apt` installs like any other local package:
 
 ```bash
-sudo tee /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-agent.json \
-  > /dev/null < <(terraform output -raw cloudwatch_agent_config)
-sudo systemctl restart amazon-cloudwatch-agent
+ARCH=amd64                      # arm64 on a Graviton instance
+cd /tmp
+curl -fsSLO "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/${ARCH}/latest/amazon-cloudwatch-agent.deb"
+curl -fsSLO "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/${ARCH}/latest/amazon-cloudwatch-agent.deb.sig"
+curl -fsSL https://amazoncloudwatch-agent.s3.amazonaws.com/assets/amazon-cloudwatch-agent.gpg | gpg --import
+gpg --verify amazon-cloudwatch-agent.deb.sig amazon-cloudwatch-agent.deb
+sudo apt-get install -y ./amazon-cloudwatch-agent.deb
+systemctl status amazon-cloudwatch-agent
 ```
+
+`gpg --verify` has to report a good signature from the *Amazon CloudWatch Agent*
+key (`3B789C72`) before the install step; the version this resolves to is at
+`https://amazoncloudwatch-agent.s3.amazonaws.com/info/latest/CWAGENT_VERSION`.
+The `*.deb.sig` and the GPG key are the verification material AWS documents for
+this package.
+
+Amazon also publishes an apt repository for the agent
+(`https://packages.aws.amazon.com/amazoncloudwatch-agent/ubuntu/`) with an
+`amazoncloudwatch-agent.list` entry signed by the AWS CLI archive key, which
+gives you `apt upgrade` for the agent. It carries one `dists/` directory per
+Ubuntu release, so a distribution too new for it fails the same way a too-old
+Terraform repo does — check with `apt-cache policy amazon-cloudwatch-agent` and
+fall back to the `.deb` above if there is no candidate.
+
+The package starts a systemd service as root, which it has to be: it reads
+`/var/lib/docker/containers/*/*.log` (the `docker_container_log_glob` this repo
+passes through). Now the config — and the path is not free: the service runs
+`start-amazon-cloudwatch-agent` with no `-c`, so the agent reads the default
+`/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json` and nothing
+else. A config saved under any other name is invisible to it, and the service
+exits 1 with `No json config files found, please provide config, exit now`:
+
+```bash
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+  > /dev/null < <(terraform output -raw cloudwatch_agent_config)
+sudo systemctl enable --now amazon-cloudwatch-agent
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+```
+
+`-a status` prints the running config and whether the agent is started; if it
+prints `stopped`, the agent's own log says why —
+`/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log`.
+
+No IAM change is needed for the agent. AWS's own instructions ask for the
+managed policy `CloudWatchAgentServerPolicy`; the worker profile this apply
+attaches already grants the narrower three calls on the two log groups
+(`WriteOperationalLogs`, `terraform/iam.tf:80`), and it has to run under that
+profile anyway — so attaching AWS's managed policy would add grants nothing
+here calls.
 
 Then point the Compose stack at the outputs, in the host's `.env`
 (`docs/remote-deploy.md` has the full walk-through):

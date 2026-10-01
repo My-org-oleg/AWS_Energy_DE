@@ -9,7 +9,7 @@ and commissioning date, and a Streamlit + PyDeck map app that visualises the mar
 Implemented. The ETL pipeline (extract → staging → core → marts) runs end-to-end via the CLI
 (`python -m etl <stage>`, or `run-all` for the whole pass; Click hyphenates the `run_all`
 Python function name) and is covered by a full integration
-test suite (pytest, 534 tests against a dedicated scratch PostGIS database), and the
+test suite (pytest, 535 tests against a dedicated scratch PostGIS database), and the
 Streamlit viz app
 (`viz/`, T1–T4, no-auth map with per-source icon layers (IconLayer), area choropleth and header
 aggregates) runs in the containerized stack. Design work recorded in:
@@ -152,15 +152,16 @@ aws ec2 start-instance --instance-id i-0123456789abcdef0
 ```
 
 **3. Install the CloudWatch agent on the host**, with the rendered config so it always
-matches the log groups the apply created:
+matches the log groups the apply created. `terraform/README.md` has the download and
+signature check; the filename below is the agent's default config path, which is the only
+one its systemd unit reads:
 
 ```bash
-terraform -chdir=terraform output -raw cloudwatch_agent_config > /tmp/cloudwatch-agent.json
-scp /tmp/cloudwatch-agent.json ec2-user@<host>:/tmp/
-# on the host (Amazon Linux 2 / AL2023):
+terraform -chdir=terraform output -raw cloudwatch_agent_config > /tmp/amazon-cloudwatch-agent.json
+scp /tmp/amazon-cloudwatch-agent.json ubuntu@<host>:/tmp/
+# on the host (Ubuntu), after installing the signed .deb:
 sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-sudo yum install -y amazon-cloudwatch-agent
-sudo cp /tmp/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-agent.json
+sudo cp /tmp/amazon-cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 sudo systemctl enable --now amazon-cloudwatch-agent
 ```
 
@@ -248,7 +249,7 @@ The suite is hermetic: it needs its own database and nothing else — no raw dat
 pre-seeded dev database, and it never reads `data/`.
 
 ```sh
-.venv/bin/python -m pytest                                 # 534 tests, ~55s
+.venv/bin/python -m pytest                                 # 535 tests, ~55s
 ```
 
 Set `TEST_DATABASE_URL` in `.env` (see `.env.example`) to any throwaway database name —

@@ -81,9 +81,13 @@ datalake, so "what happened to that file" is one place to look:
 - Worker metrics are derived from log lines the worker already prints (started,
   bootstrap blocked, boundary applied, ETL errors). Metrics only, no alarm: the two alert
   paths below already report problems
-- A pattern only fires if it can match the line it was written for, so each one is checked
-  against the output of `python -m etl startup`. A `?` on a line that starts its own text
-  would publish nothing while looking configured
+- A pattern only fires if it can match the line it was written for, and CloudWatch
+  rejects a whole filter over one bad term: a term may only carry `[A-Za-z0-9_.-]`
+  unquoted (the colon in the two report lines does not), and `?term` is CloudWatch's
+  JSON-field selector, not an anchor — on plain text it parses and never fires. Both
+  rules are checked against the output of `python -m etl startup` in
+  `tests/test_terraform_config.py`, so a pattern that would fail the apply fails the
+  build instead
 
 ## 4. Notifications
 - Errors in ETL trigger SNS-alert with email subscription
