@@ -247,6 +247,22 @@ deleting or deactivating the retained Core unit.
 | bad_quality    | bool      | the row's bad-quality flag                                           |
 | recorded_at    | timestamp | when the membership was recorded                                     |
 
+#### bootstrap_alerts - one row per blocked startup already alerted on
+A fatal startup condition refuses the worker and the container exits, so the restart
+policy re-runs the bootstrap with the same condition. This table is the claim that stops
+that becoming one SNS message per restart (ADR 0009). The claim is cleared for a bucket
+when a startup finally succeeds, so a condition that returns later alerts as a new
+incident.
+
+| Column           | Data type    | Description                                                                    |
+|------------------|--------------|--------------------------------------------------------------------------------|
+| fingerprint      | str          | pk; bucket, reason, missing required keys and the error's type                |
+| bucket           | str          | S3 bucket whose bootstrap was refused                                           |
+| reason           | str          | precondition, missing-boundary, boundary-release or enqueue                    |
+| missing_keys     | str[]        | required fixed keys the bootstrap did not find                                  |
+| error            | text         | error text recorded for context; not part of the fingerprint                   |
+| alerted_at       | timestamp    | when the alert was published                                                   |
+
 
 ### 3. Staging
 #### Units tables: bio, gas, hydro, solar, wind
@@ -370,6 +386,21 @@ deleting or deactivating the retained Core unit.
 - **Number of installations** pivot table (region / energy source)
 - **Generation capacity pivot** table (region / energy source)
 - **Storage capacity** pivot table (region / energy source)
+
+All three roll up Active units only, evaluated at the current date
+(`ADR 0003`): commissioned on or before today, and not decommissioned before today.
+
+#### definition_fingerprints - which pivot SQL each stored view was created from
+A materialized view is created once and only refreshed thereafter, so editing a pivot's
+SQL does not reach a database that already holds the view. This table is how the marts
+stage notices and repairs that (ADR 0003). A row with no corresponding fingerprint counts
+as stale, which is how a database built before this table existed gets repaired.
+
+| Column             | Data type | Description                                                     |
+|--------------------|-----------|-----------------------------------------------------------------|
+| view_name          | str       | pk; the marts view the row describes                            |
+| source_fingerprint | str       | SHA-256 of the pivot SQL, whitespace-normalized                 |
+| updated_at         | timestamp | when the fingerprint was written                                 |
 
 ## Tools
 1. Data Processing: Python (Pandas, GeoPandas)

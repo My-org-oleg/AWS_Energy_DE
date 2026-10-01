@@ -349,7 +349,7 @@ Two GitHub Actions workflows keep the images honest:
 | `DATABASE_URL` | — (required) | the pipeline role's PostGIS URL; server variants read it from the environment (no seeded volume) |
 | `S3_BUCKET` | — (required) | versioned data bucket holding the fixed `boundaries/` and `sources/` keys |
 | `SQS_QUEUE_URL` | — (required) | queue carrying the S3 ObjectCreated events |
-| `SNS_TOPIC_ARN` | — (required) | topic for ingestion and DLQ alerts |
+| `SNS_TOPIC_ARN` | — (required) | topic for the worker, blocked-startup and DLQ alerts |
 | `AWS_DEFAULT_REGION` | — (required) | region the worker container builds its AWS clients in; without it boto3 would look for one on the instance metadata service |
 | `VIZ_DATABASE_URL` | — (required) | the read-only `viz_reader` URL the app connects as; must match `docker/viz_reader.sql` |
 | `DB_USER`/`DB_PASSWORD`/`DB_HOST`/`DB_PORT`/`DB_NAME` | `etl`/`etl`/`db`/`5432`/`energy_de` | what the seed script writes into `docker.env` `DATABASE_URL` (for the pipeline) |

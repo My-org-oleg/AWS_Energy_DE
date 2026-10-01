@@ -144,6 +144,7 @@ class MartsReport(ReportBase):
     """Result of building (creating/refreshing/verifying) the marts views."""
 
     created: list[str] = field(default_factory=list)
+    recreated: list[str] = field(default_factory=list)
     refreshed: list[str] = field(default_factory=list)
     refresh_times: dict[str, float] = field(default_factory=dict)
     verified: bool = False
@@ -153,6 +154,7 @@ class MartsReport(ReportBase):
     def summary(self) -> str:
         lines = [
             "  Created          : " + (", ".join(self.created) or "none"),
+            "  Recreated        : " + (", ".join(self.recreated) or "none"),
             "  Refreshed        : " + (", ".join(self.refreshed) or "none"),
             "  Refresh times    : "
             + (

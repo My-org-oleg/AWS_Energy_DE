@@ -27,6 +27,37 @@ stale Boundary levels. Issue #8 requires a safe, repeatable operator startup.
   fatal: the command exits non-zero before the worker starts, so the
   container's restart policy crash-loops until the operator fixes it. A
   missing Source object is non-fatal.
+- **A refusal is published, once per distinct condition.** The crash loop is
+  the deployment saying "still broken" to itself, and it says it to nobody:
+  the container's console does not survive the restart. So each refusal
+  publishes on the one alert topic, naming the bucket and either the missing
+  fixed keys or the error, and the worker is refused either way — the alert is
+  a report, never a decision. The dedup key is a fingerprint of the refusal
+  (bucket, reason, missing required keys, and the error's *type*), recorded in
+  `service.bootstrap_alerts`, because the restart policy re-runs the identical
+  refusal and a message per iteration is how a topic teaches its subscribers to
+  ignore it. The error contributes its type rather than its message for the
+  same reason: a message carrying a row number or a timestamp would mint a new
+  fingerprint on every restart. A refusal that *changes* is a new fact and does
+  alert. A publish that fails hands the claim back rather than swallowing it,
+  because every restart is another chance and a transient SNS error must not
+  silence the alert about an outage that is still happening.
+- **A claim is forgotten once the bucket starts.** The dedup is over a run of
+  restarts, not over the lifetime of the bucket. A claim kept forever would
+  silence a *recurrence* as well as a repeat: the release is published, the
+  deployment starts, the release is later deleted by something careless, and the
+  deployment crash-loops in exactly the way it did before — to nobody, because
+  that condition's claim is still in the table from the first incident. So a
+  successful startup clears the bucket's claims, and the boundary between one
+  incident and the next is the fix. Clearing is best effort and never fatal: it
+  must not stop a deployment that has just prepared itself, and the cost of
+  getting it wrong is one missed alert on a later recurrence.
+- **Each refusal names its own remedy.** The reason is a closed set
+  (`precondition`, `missing-boundary`, `boundary-release`, `enqueue`) and the
+  alert body carries the fix for that one. Applying the Boundary releases and
+  enqueueing the Source versions are two steps, refused separately: an alert
+  titled "Boundary release rejected" that was really a queue that could not be
+  reached sends the operator to re-upload a release that is published and fine.
 - **The bootstrap creates no Ingestion run.** A run belongs to the worker's
   processing of a message, not to the enqueue. Boundary releases applied by
   the bootstrap are recorded in the `loaded_files` ledger with a synthetic run
@@ -53,8 +84,8 @@ stale Boundary levels. Issue #8 requires a safe, repeatable operator startup.
   known Source versions are not re-enqueued, and the marts refresh is
   repeatable.
 - Operators get one fatal path (Boundary), one non-fatal path (Source), and
-  one explicit recovery path (redrive) — each observable in the container logs
-  and the `service` schema.
+  one explicit recovery path (redrive) — each observable in the container logs,
+  on the alert topic, and in the `service` schema.
 - The startup order is verified by `tests/test_ingestion.py` against real
   PostGIS with fake AWS adapters; the deployment contract (no seed volume, no
   published db port, startup command, environment settings) is asserted by

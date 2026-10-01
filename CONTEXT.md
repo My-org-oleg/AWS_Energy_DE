@@ -129,7 +129,10 @@ _Avoid_: Message ID, filename alone
 The extract layer: versioned per-source unit tables with secondary attributes folded into a `secondary_attributes` jsonb column. Records only — the load-signature log and the boundary reference layer live in the Service schema (see Service).
 
 **Service**:
-The operational-metadata schema, deliberately separate from the versioned raw datalake: `ingestion_runs` for processing lifecycles, the `loaded_files` success log (see Load signature), `source_memberships` for Source lineage, and the non-versioned level-coded `boundaries` reference layer used by the transform spatial joins. Non-versioned by design; only the unit tables are versioned.
+The operational-metadata schema, deliberately separate from the versioned raw datalake: `ingestion_runs` for processing lifecycles, the `loaded_files` success log (see Load signature), `source_memberships` for Source lineage, the non-versioned level-coded `boundaries` reference layer used by the transform spatial joins, and `bootstrap_alerts` for the blocked-startup alert claims (see Startup alert claim). Non-versioned by design; only the unit tables are versioned.
+
+**Startup alert claim**:
+The record that one blocked startup has already been announced on the alert topic, keyed by a fingerprint of the refusal (bucket, reason, missing required keys, and the error's *type*). It is what keeps a crash-looping deployment from publishing the same message on every restart, and it is forgotten once the bucket starts successfully — so a condition that returns later alerts as a new incident.
 
 **Unit key**:
 The staging `unit_id`, persisted under that column name in `source_memberships.unit_key` so lineage and staging can be joined without qualifying which Core table the unit belongs to.

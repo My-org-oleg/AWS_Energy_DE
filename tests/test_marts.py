@@ -122,7 +122,15 @@ class TestTableShape:
 #  Shared helpers for the shared mart state                            #
 # ------------------------------------------------------------------ #
 
-ACTIVE = "decommissioning_date IS NULL OR decommissioning_date > CURRENT_DATE"
+# The active-unit rule written out again, on purpose. The reconciliation tests
+# below compare the stored pivots against an aggregation computed from core
+# with *this* text rather than with `etl.marts._ACTIVE`, so a rule that drifts
+# in the pipeline cannot quietly redefine what the stored numbers are supposed
+# to equal. Keep it in step with `etl/marts.py` by hand.
+ACTIVE = (
+    "commissioning_date <= CURRENT_DATE "
+    "AND (decommissioning_date IS NULL OR decommissioning_date >= CURRENT_DATE)"
+)
 
 
 def _cells(sql: str) -> dict[tuple[str, str], float]:
@@ -156,8 +164,19 @@ def _null_states(view: str) -> int:
     return int(_scalar(f"SELECT COUNT(*) FROM {MARTS_SCHEMA}.{view} WHERE state IS NULL"))
 
 
+def _view_definition(view: str) -> str:
+    """The SQL the database actually holds for a pivot, as Postgres prints it."""
+    return str(
+        _scalar(f"SELECT pg_get_viewdef('{MARTS_SCHEMA}.{view}'::regclass, true)")
+    )
+
+
 def _insert_generator(
-    *, state: str | None, decommissioning_date=None, capacity: float = 123.5
+    *,
+    state: str | None,
+    decommissioning_date=None,
+    capacity: float = 123.5,
+    commissioning_date: str = "2010-01-01",
 ) -> str:
     """Insert a distinctive probe row into core.generators; return its id."""
     ref_id = f"test_marts_probe_{uuid.uuid4().hex[:8]}"
@@ -169,12 +188,13 @@ def _insert_generator(
                 f"decommissioning_date, longitude, latitude, geo_accuracy, "
                 f"reference_id, reference_date, secondary_attributes, "
                 f"country_iso, state, region, district, collision) "
-                f"VALUES ('wind', :cap, '2010-01-01', :decommissioning_date, "
+                f"VALUES ('wind', :cap, :commissioning_date, :decommissioning_date, "
                 f"10.0, 50.0, 1, :ref, '2020-01-01 00:00:00', NULL, "
                 f"'DEU', :state, NULL, NULL, false)"
             ),
             {
                 "cap": capacity,
+                "commissioning_date": commissioning_date,
                 "decommissioning_date": decommissioning_date,
                 "ref": ref_id,
                 "state": state,
@@ -229,6 +249,16 @@ def _set_decommissioning(table: str, ref_id: str, date: str | None) -> None:
         )
 
 
+def _today() -> str:
+    """The database's `CURRENT_DATE`, so a test never races a local clock.
+
+    Read through the connection rather than computed in Python: the pivots
+    evaluate `CURRENT_DATE` server-side, and a test that disagreed with the
+    server by a day would be testing the wrong boundary.
+    """
+    return str(_scalar("SELECT CURRENT_DATE"))
+
+
 # ------------------------------------------------------------------ #
 #  Build report contract                                              #
 # ------------------------------------------------------------------ #
@@ -256,6 +286,75 @@ class TestBuildReport:
         assert again.refreshed == list(MART_NAMES)
         assert again.verified
         assert again.errors == []
+        assert again.recreated == []
+
+    def test_a_stale_definition_is_recreated_not_just_refreshed(
+        self, _loaded_core, _marts
+    ):
+        """Editing the predicate has to reach a database that already has the views.
+
+        A materialized view is created once and refreshed thereafter, so a change
+        to the pivot SQL would otherwise be refreshed into a view still carrying
+        the old definition — and then verification, which compares against the new
+        SQL, would report drift on every build forever with nothing to fix it.
+        Recreating on a definition change is what makes the next edit to
+        `_ACTIVE` a deploy rather than a manual drop.
+        """
+        stale = _mart_definitions(CORE_SCHEMA)["installation_counts"]
+        stale_sql = stale.select_sql.replace(
+            f"({_ACTIVE})",
+            "(decommissioning_date IS NULL OR decommissioning_date > CURRENT_DATE)",
+        )
+        assert stale_sql != stale.select_sql, "the stale predicate must differ"
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"DROP MATERIALIZED VIEW {MARTS_SCHEMA}.installation_counts"))
+            conn.execute(
+                text(
+                    f"CREATE MATERIALIZED VIEW {MARTS_SCHEMA}.installation_counts "
+                    f"AS {stale_sql}"
+                )
+            )
+            conn.execute(
+                text(f"DELETE FROM {MARTS_SCHEMA}.definition_fingerprints")
+            )
+
+        report = build_marts()
+
+        assert "installation_counts" in report.recreated
+        assert report.created == []
+        assert report.verified, report.errors
+        # And the stored view now carries the rule the code has, not the one
+        # the drop replaced.
+        assert "commissioning_date <= CURRENT_DATE" in _view_definition(
+            "installation_counts"
+        )
+
+    def test_a_view_with_no_recorded_fingerprint_counts_as_stale(
+        self, _loaded_core, _marts
+    ):
+        """The database that predates the fingerprint table is the one to repair.
+
+        Every deployment built before this table existed has views whose
+        definition nobody has checked. Treating "no record" as "unknown, leave
+        it" would record the current fingerprint over an unverified definition,
+        and the build after that would find it matching and never look again —
+        which is the case that actually needed fixing.
+        """
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"DELETE FROM {MARTS_SCHEMA}.definition_fingerprints"))
+
+        report = build_marts()
+
+        assert sorted(report.recreated) == sorted(MART_NAMES)
+        assert report.created == []
+        assert report.verified, report.errors
+        # And it is now recorded, so the next build is quiet again.
+        assert build_marts().recreated == []
+
+    def test_a_fingerprint_that_has_not_changed_does_not_recreate(
+        self, _loaded_core, _marts
+    ):
+        assert build_marts().recreated == []
 
 
 # ------------------------------------------------------------------ #
@@ -360,6 +459,60 @@ class TestActiveOnly:
         assert abs(cells[key] - base) < 0.01
 
         _delete_probe("storages", ref_id)
+        build_marts()
+
+    def test_generator_commissioned_in_the_future_is_excluded(
+        self, _loaded_core, _marts
+    ):
+        """A unit published before it starts running is not installed yet.
+
+        The source can legitimately carry a commissioning date ahead of today —
+        a planned plant is data, not an error, and it stays in Core. What it
+        must not do is appear in today's installation count, which is a
+        statement about what exists now.
+        """
+        counts = _mart_cells("installation_counts", "energy_source", "installation_count")
+        caps = _mart_cells("generation_capacity", "energy_source", "generation_capacity")
+        key = ("Bayern", "wind")
+        base_count, base_cap = counts[key], caps[key]
+
+        ref_id = _insert_generator(
+            state="Bayern", commissioning_date="2999-01-01", capacity=500.0
+        )
+        build_marts()
+
+        assert _mart_cells("installation_counts", "energy_source", "installation_count")[
+            key
+        ] == base_count
+        assert abs(
+            _mart_cells("generation_capacity", "energy_source", "generation_capacity")[
+                key
+            ]
+            - base_cap
+        ) < 0.01
+
+        _delete_probe("generators", ref_id)
+        build_marts()
+
+    def test_generator_decommissioned_today_is_still_active(self, _loaded_core, _marts):
+        """"Not decommissioned before the interval end" includes the end.
+
+        This is the one day the two layers are most likely to disagree: the
+        visualization reads `>=` for the same unit. A strict bound here would
+        drop it from the marts while the map still shows it.
+        """
+        counts = _mart_cells("installation_counts", "energy_source", "installation_count")
+        key = ("Bayern", "wind")
+        base_count = counts[key]
+
+        ref_id = _insert_generator(state="Bayern", capacity=7.0)
+        _set_decommissioning("generators", ref_id, _today())
+        build_marts()
+
+        counts = _mart_cells("installation_counts", "energy_source", "installation_count")
+        assert counts[key] == base_count + 1
+
+        _delete_probe("generators", ref_id)
         build_marts()
 
 
@@ -517,3 +670,24 @@ class TestCurrentDatePivots:
     def test_every_pivot_filters_on_the_same_active_rule(self):
         for definition in _mart_definitions(CORE_SCHEMA).values():
             assert _ACTIVE in definition.select_sql
+
+    def test_the_active_rule_has_an_upper_commissioning_bound(self):
+        """A unit that is not commissioned yet is not Active.
+
+        "Active" is the interval rule with its end pinned to today, and that
+        rule has two bounds: commissioned by the end of the interval, and not
+        decommissioned before it. The second was here alone, which counted a
+        generator that starts running next year among the units installed today
+        — in the marts and in the visualization, which would then disagree
+        about the same unit on the same day.
+        """
+        assert "commissioning_date <= CURRENT_DATE" in _ACTIVE
+
+    def test_the_decommissioning_bound_is_inclusive(self):
+        """A unit decommissioned on the report date still counts for that date.
+
+        "Has not ended before the interval end" is `>=`, not `>`. The
+        visualization already reads that way, so a strict bound here would put
+        the two layers a day apart on the one day a unit is switched off.
+        """
+        assert "decommissioning_date >= CURRENT_DATE" in _ACTIVE

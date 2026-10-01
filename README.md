@@ -9,7 +9,7 @@ and commissioning date, and a Streamlit + PyDeck map app that visualises the mar
 Implemented. The ETL pipeline (extract → staging → core → marts) runs end-to-end via the CLI
 (`python -m etl <stage>`, or `run-all` for the whole pass; Click hyphenates the `run_all`
 Python function name) and is covered by a full integration
-test suite (pytest, 535 tests against a dedicated scratch PostGIS database), and the
+test suite (pytest, 550 tests against a dedicated scratch PostGIS database), and the
 Streamlit viz app
 (`viz/`, T1–T4, no-auth map with per-source icon layers (IconLayer), area choropleth and header
 aggregates) runs in the containerized stack. Design work recorded in:
@@ -249,7 +249,7 @@ The suite is hermetic: it needs its own database and nothing else — no raw dat
 pre-seeded dev database, and it never reads `data/`.
 
 ```sh
-.venv/bin/python -m pytest                                 # 535 tests, ~55s
+.venv/bin/python -m pytest                                 # 550 tests, ~55s
 ```
 
 Set `TEST_DATABASE_URL` in `.env` (see `.env.example`) to any throwaway database name —

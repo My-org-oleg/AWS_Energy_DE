@@ -571,6 +571,7 @@ def test_startup_applies_boundaries_then_enqueues_current_source_versions(
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=fixture_boundaries["processor"],
     )
 
@@ -613,6 +614,7 @@ def test_startup_refuses_the_worker_for_a_missing_boundary(fixture_boundaries, t
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=fixture_boundaries["processor"],
     )
 
@@ -624,9 +626,51 @@ def test_startup_refuses_the_worker_for_a_missing_boundary(fixture_boundaries, t
     ) == []
 
 
+def test_startup_alerts_when_a_boundary_release_is_missing(fixture_boundaries, tmp_path):
+    """A refusal that reaches only the container log is a silent outage.
+
+    The deployment crash-loops on a fatal Boundary condition, so the operator
+    has to hear about it from somewhere the crash loop cannot take away: the
+    one alert topic. The alert names the key that is missing, because "the
+    worker did not start" on its own sends them looking at the queue.
+    """
+    s3 = fixture_boundaries["s3"]
+    sqs = RecordingSQS()
+    sns = FakeSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    del s3.current["boundaries/level-2.gpkg"]
+
+    result = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=sqs,
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+
+    assert not result.worker_start_allowed
+    assert result.alerted
+    assert [subject for subject, _ in sns.messages] == ["Boundary release missing"]
+    alert = " ".join(sns.bodies.split())
+    assert "boundaries/level-2.gpkg" in alert
+    assert "energy-data" in alert
+    # The keys that are there are named too, so the alert says which release
+    # is absent rather than only that something is.
+    assert "boundaries/level-0.gpkg" in alert
+    # It says which layer is wrong: a missing Source never blocks the worker,
+    # so an alert that did not rule that out would send them to the wrong keys.
+    assert "non-fatal" in alert
+    assert "Boundary reference layer" in alert
+    # And that nothing is running, which is the part that is not recoverable
+    # by the operator waiting for a queue to drain.
+    assert "The worker has not started" in alert
+
+
 def test_startup_refuses_the_worker_for_an_invalid_boundary(fixture_boundaries, tmp_path):
     s3 = fixture_boundaries["s3"]
     sqs = RecordingSQS()
+    sns = FakeSNS()
     _publish_boundary_levels(s3, tmp_path)
     wrong_level = _boundary_frame(3)
     wrong_level["level"] = 2  # published at the level-3 key
@@ -641,6 +685,7 @@ def test_startup_refuses_the_worker_for_an_invalid_boundary(fixture_boundaries, 
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=sns,
         processor=fixture_boundaries["processor"],
     )
 
@@ -650,6 +695,255 @@ def test_startup_refuses_the_worker_for_an_invalid_boundary(fixture_boundaries, 
     assert _query(
         f"SELECT 1 FROM {schemas['service']}.loaded_files WHERE bucket IS NOT NULL"
     ) == []
+    # All four keys were found, so this is the other fatal path: the release is
+    # there and unusable. It has to alert too, and the alert has to carry the
+    # reason — "missing" here would send the operator to re-upload a file that
+    # is already published.
+    assert result.alerted
+    assert [subject for subject, _ in sns.messages] == ["Boundary release rejected"]
+    # Every key was present, so the body must not list a missing release or tell
+    # the operator to publish one — that is the remedy for the *other* fatal
+    # path, and on this one it points at a file that is already published.
+    assert "Missing:" not in sns.bodies
+    assert "was found but could not be applied" in sns.bodies
+    assert ingestion._REFUSAL_REMEDIES[ingestion.REFUSAL_MISSING_BOUNDARY] not in (
+        sns.bodies
+    )
+
+
+def test_a_queue_failure_does_not_blame_the_boundary_release(
+    fixture_boundaries, tmp_path
+):
+    """The refusal has to name what actually failed, not the step before it.
+
+    Applying the Boundary releases and enqueueing the Source versions are two
+    steps, and a shared `except` around both would answer a queue that cannot be
+    reached with "Boundary release rejected" and an instruction to re-upload a
+    release that is published and fine. The operator is sent to the wrong file.
+    """
+    s3 = fixture_boundaries["s3"]
+    sns = FakeSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    for key in ingestion.SOURCE_KEYS:
+        s3.put(key, "v1", b"not really a gpkg")
+
+    class BrokenQueue(RecordingSQS):
+        def send_message(self, _body: str) -> None:
+            raise OSError("the queue refused the message")
+
+    result = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=BrokenQueue(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+
+    assert not result.worker_start_allowed
+    assert result.alerted
+    assert [subject for subject, _ in sns.messages] == [
+        "Startup could not enqueue work"
+    ]
+    assert "not the Boundary data" in sns.bodies
+    # And explicitly not the remedy for a bad or absent release.
+    assert "re-upload" not in sns.bodies
+    assert "Publish the missing release" not in sns.bodies
+
+
+def test_every_refusal_reason_has_an_alert_subject():
+    """A refusal reason with no subject would only fail when it actually fires.
+
+    A new refusal reason is added by adding a constant and passing it to
+    `_refused`; nothing else makes it wrong, so it would pass every test here and
+    raise a KeyError in production — on the failure path, which is the worst
+    moment to discover it. The reason list is the whole check.
+    """
+    reasons = [
+        value
+        for name, value in vars(ingestion).items()
+        if name.startswith("REFUSAL_")
+    ]
+    assert reasons, "the refusal reasons should still be module constants"
+    # Both maps, because a reason with a subject but no remedy (or the reverse)
+    # raises here in production on the failure path rather than in a test.
+    assert sorted(reasons) == sorted(ingestion._REFUSAL_SUBJECTS)
+    assert sorted(reasons) == sorted(ingestion._REFUSAL_REMEDIES)
+    assert all(ingestion._REFUSAL_SUBJECTS[reason] for reason in reasons)
+    assert all(ingestion._REFUSAL_REMEDIES[reason] for reason in reasons)
+
+
+def test_a_refusal_alerts_again_after_the_condition_is_fixed(
+    fixture_boundaries, tmp_path
+):
+    """Dedup is over a run of restarts, not over the life of the bucket.
+
+    A claim kept forever silences the *recurrence* as well as the repeat: the
+    release is published, the deployment starts, months later the release is
+    deleted by something careless, and the deployment crash-loops in exactly the
+    way it did before — to nobody, because the claim for that condition is still
+    in the table from the first incident. The operator has never been told about
+    this one.
+    """
+    s3 = fixture_boundaries["s3"]
+    sns = FakeSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    del s3.current["boundaries/level-2.gpkg"]
+    config = ingestion.BootstrapConfig(bucket="energy-data")
+
+    def start():
+        return ingestion.run_startup(
+            config,
+            engine=ENGINE,
+            s3=s3,
+            sqs=RecordingSQS(),
+            sns=sns,
+            processor=fixture_boundaries["processor"],
+        )
+
+    first = start()
+    assert not first.worker_start_allowed
+    assert first.alerted
+    assert len(sns.messages) == 1
+
+    # The release is published and the deployment starts, which is the fix.
+    _publish_boundary_levels(s3, tmp_path)
+    assert start().worker_start_allowed
+    assert len(sns.messages) == 1, "starting must not send an alert"
+
+    # The same condition returns. It is a new incident, and nobody has seen it.
+    del s3.current["boundaries/level-2.gpkg"]
+    assert start().alerted
+    assert len(sns.messages) == 2
+
+
+def test_startup_does_not_realert_the_same_refusal_on_a_restart(
+    fixture_boundaries, tmp_path
+):
+    """One message per crash-loop iteration is how a topic gets ignored.
+
+    The deployment answers a fatal condition by exiting, so the restart policy
+    brings the bootstrap back with the same condition still wrong. Nothing about
+    the deployment changed, so there is nothing new to say about it.
+    """
+    s3 = fixture_boundaries["s3"]
+    sns = FakeSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    del s3.current["boundaries/level-2.gpkg"]
+
+    first = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+    second = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+
+    assert first.alerted
+    assert not second.alerted
+    assert len(sns.messages) == 1
+    # Both still refuse: deduping the alert must not soften the refusal.
+    assert not first.worker_start_allowed
+    assert not second.worker_start_allowed
+
+
+def test_startup_alerts_again_when_the_refusal_changes(fixture_boundaries, tmp_path):
+    """A refusal that changes is a new fact and gets its own alert.
+
+    Two levels missing and one missing are different problems, and an operator
+    who has just published level 1 needs to be told that level 2 is still
+    absent — silence would read as "fixed".
+    """
+    s3 = fixture_boundaries["s3"]
+    sns = FakeSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    del s3.current["boundaries/level-1.gpkg"]
+    del s3.current["boundaries/level-2.gpkg"]
+
+    first = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+    # The operator publishes level 1 and the restart finds only level 2 left.
+    s3.put(
+        "boundaries/level-1.gpkg",
+        "startup-level-1",
+        _frame_bytes(tmp_path, "level-1.gpkg", _boundary_frame(1)),
+    )
+    second = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+
+    assert first.alerted and second.alerted
+    assert len(sns.messages) == 2
+    assert "boundaries/level-2.gpkg" in " ".join(sns.bodies.split())
+
+
+def test_a_failed_bootstrap_alert_does_not_change_the_refusal(
+    fixture_boundaries, tmp_path
+):
+    """An unreachable topic must not turn a fatal condition into a started worker.
+
+    The alert is a courtesy to the operator, so it is allowed to fail — but it
+    is not allowed to decide anything. The deployment stays blocked either way,
+    and the claim is handed back so a later restart can still alert once the
+    topic recovers: silently swallowing it would lose the alert about an outage
+    that never ended.
+    """
+
+    class BrokenSNS:
+        def __init__(self):
+            self.attempts = 0
+
+        def publish(self, subject, message):
+            self.attempts += 1
+            raise RuntimeError("topic unreachable")
+
+    s3 = fixture_boundaries["s3"]
+    sns = BrokenSNS()
+    _publish_boundary_levels(s3, tmp_path)
+    del s3.current["boundaries/level-2.gpkg"]
+
+    first = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+    # The failed publish gave the claim back, so the next restart tries again.
+    second = ingestion.run_startup(
+        ingestion.BootstrapConfig(bucket="energy-data"),
+        engine=ENGINE,
+        s3=s3,
+        sqs=RecordingSQS(),
+        sns=sns,
+        processor=fixture_boundaries["processor"],
+    )
+
+    assert not first.worker_start_allowed
+    assert not second.worker_start_allowed
+    assert not first.alerted
+    assert sns.attempts == 2
 
 
 def test_startup_treats_a_missing_source_as_non_fatal(fixture_boundaries, tmp_path):
@@ -664,6 +958,7 @@ def test_startup_treats_a_missing_source_as_non_fatal(fixture_boundaries, tmp_pa
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=fixture_boundaries["processor"],
     )
 
@@ -690,6 +985,7 @@ def test_startup_does_not_reenqueue_versions_the_worker_settled(
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=processor,
     )
     assert len(first.enqueued) == len(SOURCE_NAMES)
@@ -711,6 +1007,7 @@ def test_startup_does_not_reenqueue_versions_the_worker_settled(
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=processor,
     )
 
@@ -749,6 +1046,7 @@ def test_startup_does_not_reenqueue_a_known_version_in_any_settled_state(
         engine=ENGINE,
         s3=s3,
         sqs=sqs,
+        sns=FakeSNS(),
         processor=fixture_boundaries["processor"],
     )
 
@@ -851,6 +1149,7 @@ def test_startup_command_refuses_the_worker_after_a_fatal_boundary(monkeypatch):
         release_results=(),
         enqueued=(),
         known=(),
+        alerted=True,
     )
     calls = _startup_cli(monkeypatch, result)
 
@@ -862,6 +1161,33 @@ def test_startup_command_refuses_the_worker_after_a_fatal_boundary(monkeypatch):
     assert invocation.exit_code == 1
     assert calls == ["startup"]
     assert "Worker start     : blocked" in invocation.output
+    # Whether the alert went out is part of what the operator is told. A
+    # crash-looping container's console is the one place still readable when
+    # the topic is what is broken, so "alerted" and "not alerted" have to be
+    # distinguishable here.
+    assert "Alert published  : yes" in invocation.output
+
+
+def test_startup_command_says_when_the_alert_could_not_be_sent(monkeypatch):
+    result = ingestion.StartupResult(
+        metadata_ready=True,
+        worker_start_allowed=False,
+        checks=(),
+        release_results=(),
+        enqueued=(),
+        known=(),
+        alerted=False,
+    )
+    calls = _startup_cli(monkeypatch, result)
+
+    invocation = CliRunner().invoke(
+        cli,
+        ["startup", "--bucket", "energy-data", "--queue-url", "https://queue", "--topic-arn", "arn"],
+    )
+
+    assert invocation.exit_code == 1
+    assert calls == ["startup"]
+    assert "Alert published  : no" in invocation.output
 
 
 def test_redrive_command_reenqueues_failed_versions(monkeypatch):
@@ -1963,7 +2289,8 @@ def test_worker_publishes_every_source_dataset_into_its_core_kind(
     core_storage_total = _query(
         f"SELECT COALESCE(SUM(storage_capacity), 0) AS total "
         f"FROM {schemas['core']}.storages "
-        "WHERE decommissioning_date IS NULL OR decommissioning_date > CURRENT_DATE"
+        "WHERE commissioning_date <= CURRENT_DATE "
+        "AND (decommissioning_date IS NULL OR decommissioning_date >= CURRENT_DATE)"
     )[0]["total"]
     assert float(storage_total) == pytest.approx(float(core_storage_total))
     # Generation capacity reconciles to the good fixture rows, computed here

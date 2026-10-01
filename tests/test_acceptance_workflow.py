@@ -243,8 +243,10 @@ def _walkthrough(pipeline, tmp_path, monkeypatch):
         engine=ENGINE,
         s3=s3,
         sqs=deployment.queue,
+        sns=deployment.sns,
         processor=deployment.processor,
     )
+
     seen["boundaries_at_startup"] = _boundary_snapshot(schemas)
     seen["runs_at_startup"] = _runs(schemas)
     seen["matviews_at_startup"] = _matviews(schemas)

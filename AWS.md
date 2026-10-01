@@ -62,6 +62,7 @@ datalake, so "what happened to that file" is one place to look:
 
 ### Startup and recovery (issue #8)
 - The server container runs `python -m etl startup`: an explicit bootstrap — database preconditions, the fixed S3 key checks, the current Boundary releases applied with their downstream rebuild, the current Source object versions enqueued — and only then the worker. A missing or invalid Boundary is fatal: the container refuses the worker start and crash-loops until it is fixed; a missing Source is non-fatal
+- **A refusal is announced, not just logged.** A crash loop is the deployment's own way of saying "still broken", and it says it to nobody: the container's console is gone the moment it restarts. So the bootstrap publishes the refusal on the alert topic, naming the bucket and the fixed keys that are missing (or the error, when the release is present and unusable), and the worker start is blocked either way. The alert is sent **once per distinct condition**, not once per restart: the refusal's fingerprint — bucket, reason, missing keys, and the error's *type* — is recorded in `service.bootstrap_alerts`, and a restart that finds the same one already recorded does not publish again. A refusal that *changes* is a new fact and does alert, so an operator who has just published a level learns that a different one is still absent. Once a startup finally succeeds, the bucket's claims are cleared, so the same condition returning later alerts as the new incident it is. `python -m etl startup` prints whether this attempt was the one that alerted
 - The bootstrap creates no Ingestion run and mounts no data volume — the worker reads S3 through the event queue. Repeated starts are idempotent: ledgered Boundary releases are skipped and Source versions that already have a run (succeeded, stale, terminal, DLQ, in-flight) are not re-enqueued
 - Recovery: `python -m etl redrive` re-enqueues failed or DLQ object versions (`--key` narrows to one key); the queue's redelivery resumes each version's existing run
 
@@ -90,8 +91,10 @@ datalake, so "what happened to that file" is one place to look:
   build instead
 
 ## 4. Notifications
-- Errors in ETL trigger SNS-alert with email subscription
-- CloudWatch Alarm on DLQ → SNS
+- One topic carries all three alert paths, so notification setup is a single question: which endpoints, on which topic
+- A rejected object version → the worker publishes it once, when the run settles terminal
+- A blocked startup → the bootstrap publishes it, once per distinct condition rather than once per crash-loop restart, and once more if the same condition returns after a startup has succeeded
+- DLQ non-empty → CloudWatch alarm → SNS. This is the *only* alert for retry exhaustion, so an infrastructure failure is reported once
 - Both alarms sit on the queue's own `AWS/SQS` metrics, so no problem is announced twice
 
 ## 5. IAM role for EC2

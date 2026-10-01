@@ -65,7 +65,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL (the pipeline role's PostGIS URL)}
       S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET (the versioned data bucket)}
       SQS_QUEUE_URL: ${SQS_QUEUE_URL:?set SQS_QUEUE_URL (the S3 ObjectCreated queue)}
-      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:?set SNS_TOPIC_ARN (ingestion and DLQ alerts)}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:?set SNS_TOPIC_ARN (worker, blocked-startup and DLQ alerts)}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?set AWS_DEFAULT_REGION (the deployment region)}
     restart: always
     # No volumes: the worker reads S3 through the event queue, so the private

@@ -15,6 +15,12 @@ Extraction writes the load log and the boundary reference layer into a dedicated
 
 `service` is operational metadata, not a pipeline data layer: the data model stays four layers (raw / staging / core / marts); `service` is the side-car the pipeline reads from and writes bookkeeping to. The transform stage spatial-joins against `service.boundaries`; the extract stage records load signatures in `service.loaded_files`.
 
+The line is *the pipeline's own bookkeeping*, not "everything that is not unit data". Two later records extend the schema on the same reasoning, and one of them deliberately does not use it:
+
+- `service.ingestion_runs` / `stage_results` / `source_memberships` — the event-driven deployment's processing ledgers (ADR 0009). Bookkeeping about the pipeline's own work, so `service`.
+- `service.bootstrap_alerts` — the blocked-startup alert claims (ADR 0009). Bookkeeping about the deployment's own state, so `service`.
+- `marts.definition_fingerprints` — which pivot SQL each stored view was created from (ADR 0003). This is *not* `service`: it describes a view in the `marts` schema and is meaningless without the view, so it lives beside the views it describes, is dropped and recreated with them, and `drop_all_pipeline_data.sql` clears it with the rest of that schema. Recorded here because it is the one place this ADR's rule is deliberately not followed, and a later reader comparing the two ADRs should not have to rediscover the exception.
+
 ## Consequences
 
 - The docs must say `service.boundaries` / `service.loaded_files` everywhere an earlier doc said `raw.boundaries` — this ADR supersedes that part of ADR 0004.

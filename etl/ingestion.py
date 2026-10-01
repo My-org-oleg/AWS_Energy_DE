@@ -62,6 +62,51 @@ MAX_DELIVERY_ATTEMPTS = 5
 VISIBILITY_TIMEOUT_SECONDS = 6 * 60 * 60
 VISIBILITY_HEARTBEAT_SECONDS = 60.0
 
+# The three conditions that refuse a startup, and the alert subject each one
+# publishes. Both halves are keyed on these strings: the reason goes into the
+# alert claim's fingerprint, so renaming one retires the old claim and lets the
+# condition alert once more — which is the wanted behaviour for a genuinely
+# renamed condition, and never a good reason to rename one.
+REFUSAL_PRECONDITION = "precondition"
+REFUSAL_MISSING_BOUNDARY = "missing-boundary"
+REFUSAL_BOUNDARY_RELEASE = "boundary-release"
+REFUSAL_ENQUEUE = "enqueue"
+
+_REFUSAL_SUBJECTS = {
+    REFUSAL_PRECONDITION: "Startup precondition failed",
+    REFUSAL_MISSING_BOUNDARY: "Boundary release missing",
+    REFUSAL_BOUNDARY_RELEASE: "Boundary release rejected",
+    REFUSAL_ENQUEUE: "Startup could not enqueue work",
+}
+
+# What to do about each, written per reason rather than once for all of them.
+# The Boundary reference layer is only ever the subject of two of these: a
+# release that is missing and a release that was rejected. A database that will
+# not answer, or a queue that will not accept, is a different fault with a
+# different fix, and saying "upload the release" for those would be a confident
+# pointer at the wrong thing.
+_REFUSAL_REMEDIES = {
+    REFUSAL_MISSING_BOUNDARY: (
+        "A missing Source dataset is non-fatal, so this is about the Boundary "
+        "reference layer. Publish the missing release under its fixed S3 key."
+    ),
+    REFUSAL_PRECONDITION: (
+        "This is a failure to reach or prepare the deployment's own "
+        "infrastructure (the database or the bucket), not a missing file. Check "
+        "that the database is reachable and the bucket readable."
+    ),
+    REFUSAL_BOUNDARY_RELEASE: (
+        "The Boundary release was found but could not be applied. Check the "
+        "pipeline logs for the underlying error; a re-upload under the same "
+        "fixed key is not the remedy."
+    ),
+    REFUSAL_ENQUEUE: (
+        "The Boundary layer applied, but the work could not be handed to the "
+        "worker. This is the queue or the SQS side of the deployment, not the "
+        "Boundary data."
+    ),
+}
+
 log = logging.getLogger(__name__)
 
 
@@ -271,7 +316,11 @@ class Boto3SQSAdapter:
 
 
 class Boto3SNSAdapter:
-    """The one topic carrying ingestion and DLQ alerts (issue #7 publishes)."""
+    """The one topic carrying all three alert paths (issues #7 and #8).
+
+    A rejected object version from the worker, a blocked startup from the
+    bootstrap, and — from CloudWatch rather than from here — the DLQ alarm.
+    """
 
     def __init__(self, client, topic_arn: str):
         self.client = client
@@ -690,6 +739,20 @@ def _ensure_service_metadata(engine: Engine) -> None:
                 """
             )
         )
+        connection.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SERVICE_SCHEMA}.bootstrap_alerts (
+                    fingerprint TEXT PRIMARY KEY,
+                    bucket TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    missing_keys TEXT[] NOT NULL DEFAULT '{{}}',
+                    error TEXT,
+                    alerted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
 
 
 def bootstrap(
@@ -738,6 +801,7 @@ class StartupResult:
     release_results: tuple[StageResult, ...]
     enqueued: tuple[S3ObjectId, ...]
     known: tuple[S3ObjectId, ...]
+    alerted: bool = False
 
 
 def run_startup(
@@ -746,6 +810,7 @@ def run_startup(
     engine: Engine,
     s3: S3Adapter,
     sqs: SQSAdapter,
+    sns: SNSAdapter,
     processor: MessageProcessor,
 ) -> StartupResult:
     """Bootstrap a server deployment, then report whether the worker may start.
@@ -758,35 +823,68 @@ def run_startup(
     3. the current Source object versions enqueued for the worker.
 
     A missing or invalid Boundary condition is fatal: the result says the
-    worker must not start, so the caller refuses it. A missing Source object is
-    non-fatal. No Ingestion run is created here — a run belongs to the worker's
-    processing of a message, not to the bootstrap that only prepares and
-    enqueues it.
+    worker must not start, so the caller refuses it, and the refusal is
+    announced on the alert topic, because the deployment's answer to a fatal
+    condition is to exit and let the restart policy bring it straight back. A
+    missing Source object is non-fatal and is not what that alert is about. No
+    Ingestion run is created here — a run belongs to the worker's processing of
+    a message, not to the bootstrap that only prepares and enqueues it.
     """
     try:
         report = bootstrap(config, engine=engine, s3=s3)
     except Exception as error:
-        log.error("Startup bootstrap failed: %s", error)
-        return StartupResult(
-            metadata_ready=False,
-            worker_start_allowed=False,
-            checks=(),
-            release_results=(),
-            enqueued=(),
-            known=(),
+        return _refused(
+            config,
+            engine,
+            sns,
+            report=BootstrapResult(
+                metadata_ready=False,
+                worker_start_allowed=False,
+                checks=(),
+            ),
+            reason=REFUSAL_PRECONDITION,
+            error=error,
         )
     if not report.worker_start_allowed:
-        return _refused(report)
+        return _refused(
+            config, engine, sns, report=report, reason=REFUSAL_MISSING_BOUNDARY
+        )
 
+    # The two steps are refused separately, because they are two different
+    # problems: an alert titled "Boundary release rejected" that was really a
+    # queue that could not be reached sends the operator to re-upload a release
+    # that is already published and fine.
+    # The two steps are refused separately, because they are two different
+    # problems: an alert titled "Boundary release rejected" that was really a
+    # queue that could not be reached sends the operator to re-upload a release
+    # that is already published and fine.
     try:
         release_results = tuple(
             _apply_boundary_releases(config, engine, s3, processor)
         )
+    except Exception as error:
+        return _refused(
+            config,
+            engine,
+            sns,
+            report=report,
+            reason=REFUSAL_BOUNDARY_RELEASE,
+            error=error,
+        )
+
+    try:
         enqueued, known = _enqueue_current_sources(config, engine, s3, sqs)
     except Exception as error:
-        log.error("Startup bootstrap failed: %s", error)
-        return _refused(report)
+        return _refused(
+            config,
+            engine,
+            sns,
+            report=report,
+            reason=REFUSAL_ENQUEUE,
+            error=error,
+        )
 
+    _clear_bootstrap_claims(engine, config.bucket)
     return StartupResult(
         metadata_ready=report.metadata_ready,
         worker_start_allowed=True,
@@ -797,8 +895,30 @@ def run_startup(
     )
 
 
-def _refused(report: BootstrapResult) -> StartupResult:
-    """The startup result for a deployment the worker must not start against."""
+def _refused(
+    config: BootstrapConfig,
+    engine: Engine,
+    sns: SNSAdapter,
+    *,
+    report: BootstrapResult,
+    reason: str,
+    error: Exception | None = None,
+) -> StartupResult:
+    """The startup result for a deployment the worker must not start against.
+
+    The alert is part of the refusal, not a courtesy attached to it: the
+    container is about to exit and the restart policy is about to run this
+    again, and a condition nobody was told about is an outage nobody is looking
+    for. `alerted` reports whether this attempt was the one that sent it.
+    """
+    alerted = _alert_bootstrap(
+        engine,
+        sns,
+        config,
+        reason=reason,
+        checks=report.checks,
+        error=error,
+    )
     return StartupResult(
         metadata_ready=report.metadata_ready,
         worker_start_allowed=False,
@@ -806,6 +926,7 @@ def _refused(report: BootstrapResult) -> StartupResult:
         release_results=(),
         enqueued=(),
         known=(),
+        alerted=alerted,
     )
 
 
@@ -1241,6 +1362,207 @@ def _alert_rejected(
         )
     except Exception:
         log.exception("Could not alert about the rejected %s", object_id.key)
+
+
+def _refusal_fingerprint(
+    bucket: str,
+    reason: str,
+    missing: tuple[str, ...],
+    error: Exception | None,
+) -> str:
+    """The identity of one refused startup, for deciding whether to alert.
+
+    A fatal condition refuses the worker and the container exits, so the restart
+    policy brings the bootstrap straight back — the same refusal, as many times
+    as the operator takes to look. A message per restart is how a topic teaches
+    its subscribers to ignore it, so the alert is keyed on what is wrong rather
+    than on how many times it has been seen.
+
+    The error contributes its type and not its message. A message carrying a
+    row number, a timestamp or an object version would mint a fresh fingerprint
+    on every restart, which is the storm this fingerprint exists to prevent.
+    """
+    return "|".join(
+        (
+            bucket,
+            reason,
+            ",".join(missing) if missing else "-",
+            type(error).__name__ if error is not None else "-",
+        )
+    )
+
+
+def _missing_required_keys(checks: Sequence[BootstrapCheck]) -> tuple[str, ...]:
+    """The required fixed keys the bootstrap did not find, in key order."""
+    return tuple(
+        check.key for check in checks if check.required and not check.available
+    )
+
+
+def _alert_bootstrap(
+    engine: Engine,
+    sns: SNSAdapter,
+    config: BootstrapConfig,
+    *,
+    reason: str,
+    checks: Sequence[BootstrapCheck],
+    error: Exception | None,
+) -> bool:
+    """Tell the operator the deployment must not start; True if it was sent.
+
+    The second of the three alert paths on the one topic, and the only one the
+    worker does not own: this fires before there is a worker. It is what turns a
+    container that restart-policies itself into a loop into an outage somebody
+    is told about.
+
+    The claim row is what keeps that from becoming a message per restart. The
+    fingerprint goes in first and the publish only happens if the insert was
+    new, so one distinct refusal alerts once however many times the restart
+    policy re-runs it, while a refusal that *changes* — a different level
+    missing, a different error — alerts again because it is a different fact.
+
+    Unlike `_alert_rejected`, a failed publish gives the claim back. There the
+    bounded retries of one message are spent, so a lost alert is the price of
+    never sending it twice; here every restart is another chance, and swallowing
+    the claim on a transient SNS error would silence the alert about an outage
+    that is still happening. It cannot change the refusal either way: the
+    deployment is already blocked and stays blocked.
+    """
+    missing = _missing_required_keys(checks)
+    fingerprint = _refusal_fingerprint(config.bucket, reason, missing, error)
+    log.error(
+        "Startup refused (%s) for %s: %s",
+        reason,
+        config.bucket,
+        error if error is not None else f"missing {', '.join(missing)}",
+    )
+    try:
+        with engine.begin() as connection:
+            claimed = connection.execute(
+                text(
+                    f"INSERT INTO {SERVICE_SCHEMA}.bootstrap_alerts "
+                    "(fingerprint, bucket, reason, missing_keys, error) "
+                    "VALUES (:fingerprint, :bucket, :reason, :missing_keys, :error) "
+                    "ON CONFLICT (fingerprint) DO NOTHING RETURNING fingerprint"
+                ),
+                {
+                    "fingerprint": fingerprint,
+                    "bucket": config.bucket,
+                    "reason": reason,
+                    "missing_keys": list(missing),
+                    "error": str(error) if error is not None else None,
+                },
+            ).first()
+    except Exception:
+        log.exception("Could not record the blocked startup")
+        return False
+    if not claimed:
+        log.info(
+            "Already alerted for this blocked startup (%s); not alerting again", reason
+        )
+        return False
+    try:
+        subject, message = _bootstrap_alert(config, reason, checks, missing, error)
+        sns.publish(subject, message)
+    except Exception:
+        log.exception("Could not alert about the blocked startup")
+        _release_bootstrap_claim(engine, fingerprint)
+        return False
+    return True
+
+
+def _release_bootstrap_claim(engine: Engine, fingerprint: str) -> None:
+    """Hand the claim back so a later restart can alert after all."""
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"DELETE FROM {SERVICE_SCHEMA}.bootstrap_alerts "
+                    "WHERE fingerprint = :fingerprint"
+                ),
+                {"fingerprint": fingerprint},
+            )
+    except Exception:
+        log.exception("Could not release the blocked-startup alert claim")
+
+
+def _clear_bootstrap_claims(engine: Engine, bucket: str) -> None:
+    """Forget every alert already sent for this bucket, now that it can start.
+
+    A claim that is never forgotten silences a *recurrence* as well as a repeat.
+    The missing release gets published, the deployment starts, months later the
+    release is deleted by something careless — and the deployment crashes
+    restarting in exactly the way it did before, to nobody, because the claim for
+    that condition is still sitting in the table from the first incident. The
+    dedup this table exists for is over a run of restarts, not over the lifetime
+    of the bucket, and a successful startup is where the boundary between the two
+    falls: the condition was fixed, so if it comes back it is a new incident and
+    the operator has never been told about this one.
+
+    Best effort, and deliberately not fatal: failing to tidy an alert record
+    must not stop a deployment that has just successfully prepared itself. The
+    cost of getting this wrong is one missed alert on a later recurrence; the
+    cost of refusing to start would be the outage this whole path exists to
+    report.
+    """
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"DELETE FROM {SERVICE_SCHEMA}.bootstrap_alerts "
+                    "WHERE bucket = :bucket"
+                ),
+                {"bucket": bucket},
+            )
+    except Exception:
+        log.exception("Could not clear the sent blocked-startup alerts")
+
+
+def _bootstrap_alert(
+    config: BootstrapConfig,
+    reason: str,
+    checks: Sequence[BootstrapCheck],
+    missing: tuple[str, ...],
+    error: Exception | None,
+) -> tuple[str, str]:
+    """The subject and body of the blocked-startup alert.
+
+    What an operator needs from this is the key to publish and the fact that
+    nothing is running, so the key is named and the consequence is stated. The
+    keys that *are* there are listed too: "a release is missing" is a much
+    shorter search when the answer is which of four.
+
+    The remedy is the part that has to be right. A body that tells an operator
+    to re-upload a Boundary release when the queue was what failed sends them
+    away from the actual fault, so each reason states its own next step and
+    nothing claims a cause it cannot see.
+    """
+    available = ", ".join(
+        check.key for check in checks if check.required and check.available
+    )
+    if error is not None:
+        headline = f"Startup could not prepare {config.bucket}: {error}"
+    else:
+        headline = (
+            f"Startup refused to start the ingestion worker: "
+            f"{len(missing)} required Boundary release(s) are missing from "
+            f"{config.bucket}."
+        )
+    lines = [headline, f"Bucket: {config.bucket}"]
+    if missing:
+        lines.append(f"Missing: {', '.join(missing)}")
+    if available:
+        lines.append(f"Published: {available}")
+    lines.append(f"{_REFUSAL_REMEDIES[reason]}")
+    lines.append(
+        "The worker has not started, and the container exits so the restart "
+        "policy retries the bootstrap; this alert is sent once per distinct "
+        "condition, so a repeat of the same one is silent by design."
+    )
+    # A KeyError here would be an internal mistake — a refusal reason with no
+    # subject — and it is raised rather than defaulted because a wrong subject
+    # still reaches an operator and quietly mislabels the outage.
+    return _REFUSAL_SUBJECTS[reason], "\n".join(lines)
 
 
 def _settle_failure(

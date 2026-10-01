@@ -76,7 +76,7 @@ def bootstrap(bucket: str):
 
 @cli.command()
 @click.option("--queue-url", envvar="SQS_QUEUE_URL", required=True, help="Queue carrying the S3 ObjectCreated events.")
-@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for ingestion and DLQ alerts.")
+@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for the worker, blocked-startup and DLQ alerts.")
 @click.option("--max-messages", type=int, default=None, help="Stop after this many messages (default: run until stopped).")
 def worker(queue_url: str, topic_arn: str, max_messages: int | None):
     """Run the event-driven ingestion worker, one SQS message at a time.
@@ -110,7 +110,7 @@ def worker(queue_url: str, topic_arn: str, max_messages: int | None):
 @cli.command()
 @click.option("--bucket", envvar="S3_BUCKET", required=True, help="Versioned S3 data bucket.")
 @click.option("--queue-url", envvar="SQS_QUEUE_URL", required=True, help="Queue carrying the S3 ObjectCreated events.")
-@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for ingestion and DLQ alerts.")
+@click.option("--topic-arn", envvar="SNS_TOPIC_ARN", required=True, help="Topic for rejected-file, blocked-startup and DLQ alerts.")
 def startup(bucket: str, queue_url: str, topic_arn: str):
     """Bootstrap the server deployment, then run the ingestion worker.
 
@@ -119,15 +119,19 @@ def startup(bucket: str, queue_url: str, topic_arn: str):
     rebuild, and the current Source object versions enqueued — then the worker.
     A fatal Boundary condition (a missing or invalid release) refuses the
     worker start, so the container crash-loops until the operator fixes it.
+    Because a crash loop is not a notification, the refusal is announced on the
+    topic as well — once per distinct condition, not once per restart.
     """
     engine = get_engine()
     s3 = _s3_adapter()
+    sns = _sns_adapter(topic_arn)
     processor = PipelineProcessor(engine, s3=s3)
     result = run_startup(
         BootstrapConfig(bucket=bucket),
         engine=engine,
         s3=s3,
         sqs=_sqs_adapter(queue_url),
+        sns=sns,
         processor=processor,
     )
 
@@ -148,8 +152,11 @@ def startup(bucket: str, queue_url: str, topic_arn: str):
     for object_id in result.enqueued:
         click.echo(f"    {object_id.key} ({object_id.version_id})")
     click.echo(f"  Already known    : {len(result.known)} source object version(s)")
-
     if not result.worker_start_allowed:
+        # Only worth printing when it is news: on a healthy start there is
+        # nothing to have alerted about. On a blocked one, "no" is the answer an
+        # operator needs, because it means nobody was told except by the log.
+        click.echo(f"  Alert published  : {'yes' if result.alerted else 'no'}")
         raise SystemExit(1)
 
     click.echo(f"\nIngestion worker reading {queue_url}")
@@ -157,7 +164,7 @@ def startup(bucket: str, queue_url: str, topic_arn: str):
         engine=engine,
         s3=s3,
         sqs=_sqs_adapter(queue_url),
-        sns=_sns_adapter(topic_arn),
+        sns=sns,
         processor=processor,
     )
 
